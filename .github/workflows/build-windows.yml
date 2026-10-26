@@ -1,0 +1,102 @@
+name: Build Zed for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zed-windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Zed
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set stable channel and detect version
+        id: version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content "crates/zed/Cargo.toml" -Raw
+
+          if ($manifest -notmatch '(?ms)^\[package\]\s.*?^version\s*=\s*"([^"]+)"') {
+            throw "Could not determine Zed version from crates/zed/Cargo.toml"
+          }
+
+          $version = $Matches[1]
+
+          if ($version -notmatch '^\d+\.\d+\.\d+([+-][0-9A-Za-z.-]+)?$') {
+            throw "Unexpected Zed version format: $version"
+          }
+
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "crates/zed/RELEASE_CHANNEL"),
+            "stable",
+            [System.Text.Encoding]::ASCII
+          )
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "source_sha=${{ github.sha }}" >> $env:GITHUB_OUTPUT
+          "source_branch=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Zed version: $version"
+          Write-Host "Release channel: stable"
+
+      - name: Build Zed
+        shell: pwsh
+        run: |
+          cargo build --release --verbose --package zed
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          $exe = "target/release/zed.exe"
+
+          if (!(Test-Path $exe)) {
+            Write-Error "Executable not found: $exe"
+
+            Get-ChildItem target -Filter zed.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+
+            exit 1
+          }
+
+          Get-Item $exe | Format-List FullName, Length, LastWriteTime
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "release-package" -Force | Out-Null
+
+          Copy-Item "target/release/zed.exe" "release-package/zed.exe"
+
+          @"
+          version=${{ steps.version.outputs.version }}
+          source_sha=${{ steps.version.outputs.source_sha }}
+          source_branch=${{ steps.version.outputs.source_branch }}
+          run_id=${{ github.run_id }}
+          run_number=${{ github.run_number }}
+          "@ | Set-Content "release-package/build-info.txt" -Encoding ascii
+
+      - name: Upload tested executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-windows-${{ github.run_id }}
+          path: release-package/
+          if-no-files-found: error
+          retention-days: 30
