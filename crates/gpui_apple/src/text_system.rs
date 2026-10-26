@@ -632,6 +632,8 @@ impl AppleTextSystemState {
             ascent: max_ascent.into(),
             descent: max_descent.into(),
             len: text.len(),
+            index_positions: Vec::new(),
+            visual_index_positions: Vec::new(),
         }
     }
 }

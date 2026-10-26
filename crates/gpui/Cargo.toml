@@ -95,6 +95,7 @@ scheduler.workspace = true
 resvg.workspace = true
 usvg.workspace = true
 ttf-parser = "0.25"
+unicode-bidi.workspace = true
 schemars = { workspace = true, features = ["derive"] }
 seahash = "4.1"
 serde = { workspace = true, features = ["derive"] }
