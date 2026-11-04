@@ -1,9 +1,11 @@
+mod direction;
 mod font_fallbacks;
 mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
 
+pub use direction::*;
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
@@ -675,6 +677,29 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> ShapedLine {
+        self.shape_line_with_direction(
+            text,
+            font_size,
+            runs,
+            force_width,
+            TextDirection::LeftToRight,
+        )
+    }
+
+    /// Shape the given line with an explicit base paragraph direction.
+    ///
+    /// Platforms that support right-to-left paragraph layout (DirectWrite on
+    /// Windows) apply `direction` as the UAX #9 paragraph embedding level;
+    /// other platforms ignore it and keep left-to-right shaping. Like
+    /// [`Self::shape_line`], this must be used only for single-line text (no `\n`).
+    pub fn shape_line_with_direction(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+        direction: TextDirection,
+    ) -> ShapedLine {
         debug_assert!(
             text.find('\n').is_none(),
             "text argument should not contain newlines"
@@ -700,7 +725,8 @@ impl WindowTextSystem {
             });
         }
 
-        let layout = self.layout_line(&text, font_size, runs, force_width);
+        let layout =
+            self.layout_line_with_direction(&text, font_size, runs, force_width, direction);
 
         ShapedLine {
             layout,
@@ -788,6 +814,31 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_direction(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+            TextDirection::LeftToRight,
+        )
+    }
+
+    /// Shape a multi line string of text with an explicit base paragraph
+    /// direction.
+    ///
+    /// Platforms that support right-to-left paragraph layout (DirectWrite on
+    /// Windows) apply `direction` as the UAX #9 paragraph embedding level;
+    /// other platforms ignore it and keep left-to-right shaping.
+    pub fn shape_text_with_direction(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        direction: TextDirection,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -852,6 +903,7 @@ impl WindowTextSystem {
                 &line_text,
                 font_size,
                 &font_runs,
+                direction,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
             );
@@ -923,6 +975,28 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
+        self.layout_line_with_direction(
+            text,
+            font_size,
+            runs,
+            force_width,
+            TextDirection::LeftToRight,
+        )
+    }
+
+    /// Layout the given line of text with an explicit base paragraph direction.
+    ///
+    /// Platforms that support right-to-left paragraph layout (DirectWrite on
+    /// Windows) apply `direction` as the UAX #9 paragraph embedding level;
+    /// other platforms ignore it and keep left-to-right shaping.
+    pub fn layout_line_with_direction(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+        direction: TextDirection,
+    ) -> Arc<LineLayout> {
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();
@@ -959,6 +1033,7 @@ impl WindowTextSystem {
             &SharedString::new(text),
             font_size,
             &font_runs,
+            direction,
             force_width,
         );
 
@@ -979,6 +1054,7 @@ impl WindowTextSystem {
                     len: buffer.len(),
                     font_id,
                 }],
+                TextDirection::LeftToRight,
                 None,
             )
             .width
@@ -1064,6 +1140,7 @@ impl WindowTextSystem {
         text_len: usize,
         font_size: Pixels,
         runs: &[TextRun],
+        direction: TextDirection,
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
@@ -1104,6 +1181,7 @@ impl WindowTextSystem {
             text_len,
             font_size,
             &font_runs,
+            direction,
             force_width,
             materialize_text,
         );

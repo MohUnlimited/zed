@@ -42,8 +42,8 @@ use crate::{
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
     LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, Priority,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
-    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
-    hash, point, px, size,
+    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, TextDirection, Window,
+    WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -1549,7 +1549,18 @@ pub trait PlatformTextSystem: Send + Sync {
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
     /// Layout a line of text with the given font runs.
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
+    ///
+    /// `direction` is the requested base paragraph direction: platforms that
+    /// support right-to-left paragraph layout (DirectWrite) apply it as the
+    /// UAX #9 paragraph embedding level; platforms that do not must ignore it
+    /// and report [`TextDirection::LeftToRight`] on the resulting layout.
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        direction: TextDirection,
+    ) -> LineLayout;
     /// Returns the recommended text rendering mode for the given font and size.
     fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
     -> TextRenderingMode;
@@ -1633,7 +1644,13 @@ impl PlatformTextSystem for NoopTextSystem {
         Ok((raster_bounds.size, Vec::new()))
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, _runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        _runs: &[FontRun],
+        _direction: TextDirection,
+    ) -> LineLayout {
         let mut position = px(0.);
         let metrics = self.font_metrics(FontId(0));
         let em_width = font_size
@@ -1679,6 +1696,7 @@ impl PlatformTextSystem for NoopTextSystem {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: TextDirection::LeftToRight,
         }
     }
 

@@ -2067,6 +2067,7 @@ impl Editor {
                 style,
                 editor_width,
                 |_| false,
+                false,
                 window,
                 cx,
             )

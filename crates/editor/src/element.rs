@@ -48,13 +48,14 @@ use gpui::{
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     ParentElement, Pixels, ScaledPixels, ScrollHandle, ShapedLine, SharedString, Size,
-    StatefulInteractiveElement, Style, Styled, StyledText, TaskExt, TextAlign, TextRun,
-    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, div, fill, outline, pattern_slash,
-    point, px, quad, relative, size, solid_background, transparent_black, underline_y_offset,
+    StatefulInteractiveElement, Style, Styled, StyledText, TaskExt, TextAlign, TextDirection,
+    TextRun, TextStyleRefinement, UnderlineStyle, WeakEntity, Window, detect_text_direction, div,
+    fill, outline, pattern_slash, point, px, quad, relative, size, solid_background,
+    transparent_black, underline_y_offset,
 };
 use itertools::Itertools;
 use language::{
-    Diagnostic, HighlightedText, IndentGuideSettings, LanguageAwareStyling,
+    Diagnostic, HighlightedText, IndentGuideSettings, Language, LanguageAwareStyling,
     language_settings::ShowWhitespaceSetting,
 };
 use markdown::Markdown;
@@ -3195,6 +3196,7 @@ impl EditorElement {
         editor_width: Pixels,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
         bg_segments_per_row: &[Vec<(Range<DisplayPoint>, Hsla)>],
+        detect_paragraph_direction: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<LineWithInvisibles> {
@@ -3241,6 +3243,7 @@ impl EditorElement {
                         diagnostic_underline_severity_ranges: Vec::new(),
                         point_diagnostics: Vec::new(),
                         font_size,
+                        direction: TextDirection::LeftToRight,
                     }
                 })
                 .collect()
@@ -3261,6 +3264,7 @@ impl EditorElement {
                 editor_width,
                 is_row_soft_wrapped,
                 bg_segments_per_row,
+                detect_paragraph_direction,
                 window,
                 cx,
             )
@@ -3342,6 +3346,9 @@ impl EditorElement {
                     )
                 };
                 let line_ix = align_to.row().0.checked_sub(rows.start.0);
+                let detect_paragraph_direction = language_supports_paragraph_direction(
+                    snapshot.buffer_snapshot().language_at(MultiBufferOffset(0)),
+                );
                 let custom_block_x_position =
                     if let Some(layout) = line_ix.and_then(|ix| line_layouts.get(ix as usize)) {
                         x_and_width(layout)
@@ -3352,6 +3359,7 @@ impl EditorElement {
                             &self.style,
                             editor_width,
                             is_row_soft_wrapped,
+                            detect_paragraph_direction,
                             window,
                             cx,
                         ))
@@ -6643,8 +6651,7 @@ impl EditorElement {
                 let mut x_ranges = line_layout.x_ranges_for_range(range_start..range_end);
                 if x_ranges.is_empty() {
                     x_ranges.push(
-                        line_layout.x_for_index(range_start)
-                            ..line_layout.x_for_index(range_end),
+                        line_layout.x_for_index(range_start)..line_layout.x_for_index(range_end),
                     );
                 }
                 if row != range.end.row() {
@@ -7514,6 +7521,10 @@ pub(crate) struct LineWithInvisibles {
     len: usize,
     pub(crate) width: Pixels,
     font_size: Pixels,
+    /// The display direction of this row, detected from its content when the
+    /// buffer supports automatic paragraph direction. This drives alignment:
+    /// right-to-left rows are aligned to the right edge.
+    direction: TextDirection,
 }
 
 enum LineFragment {
@@ -7549,6 +7560,7 @@ impl LineWithInvisibles {
         text_width: Pixels,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
         bg_segments_per_row: &[Vec<(Range<DisplayPoint>, Hsla)>],
+        detect_paragraph_direction: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<Self> {
@@ -7567,6 +7579,11 @@ impl LineWithInvisibles {
         let mut styles = Vec::new();
         let mut non_whitespace_added = false;
         let mut row = 0;
+        // The base direction for the row currently being assembled. Detected
+        // from the row's text when the buffer supports automatic paragraph
+        // direction; computed at the first flush and reused so that all
+        // fragments of a row are shaped consistently.
+        let mut row_direction = None::<TextDirection>;
         let mut line_exceeded_max_len = false;
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let min_contrast = EditorSettings::get_global(cx).minimum_contrast_for_highlights;
@@ -7598,11 +7615,19 @@ impl LineWithInvisibles {
                     } else {
                         &Self::split_runs_by_bg_segments(&styles, segments, min_contrast, len)
                     };
-                    let shaped_line = window.text_system().shape_line(
+                    let row_text_direction = row_direction.get_or_insert_with(|| {
+                        if detect_paragraph_direction {
+                            detect_text_direction(&line)
+                        } else {
+                            TextDirection::LeftToRight
+                        }
+                    });
+                    let shaped_line = window.text_system().shape_line_with_direction(
                         line.as_str().into(),
                         font_size,
                         text_runs,
                         None,
+                        *row_text_direction,
                     );
                     width += shaped_line.width;
                     len += shaped_line.len;
@@ -7620,11 +7645,18 @@ impl LineWithInvisibles {
                             } else {
                                 SharedString::from(Arc::from(highlighted_chunk.text))
                             };
-                            let shaped_line = window.text_system().shape_line(
+                            let shaped_line = window.text_system().shape_line_with_direction(
                                 chunk,
                                 font_size,
                                 &[text_style.to_run(highlighted_chunk.text.len())],
                                 None,
+                                *row_direction.get_or_insert_with(|| {
+                                    if detect_paragraph_direction {
+                                        detect_text_direction(&line)
+                                    } else {
+                                        TextDirection::LeftToRight
+                                    }
+                                }),
                             );
                             AvailableSpace::Definite(shaped_line.width)
                         } else {
@@ -7671,7 +7703,19 @@ impl LineWithInvisibles {
 
                         let line_layout = window
                             .text_system()
-                            .shape_line(x, font_size, &[run], None)
+                            .shape_line_with_direction(
+                                x,
+                                font_size,
+                                &[run],
+                                None,
+                                *row_direction.get_or_insert_with(|| {
+                                    if detect_paragraph_direction {
+                                        detect_text_direction(&line)
+                                    } else {
+                                        TextDirection::LeftToRight
+                                    }
+                                }),
+                            )
                             .with_len(highlighted_chunk.text.len());
 
                         if let Some(severity) = highlighted_chunk.diagnostic_underline_severity {
@@ -7695,11 +7739,20 @@ impl LineWithInvisibles {
                         } else {
                             &Self::split_runs_by_bg_segments(&styles, segments, min_contrast, len)
                         };
-                        let shaped_line = window.text_system().shape_line(
+                        let shaped_line = window.text_system().shape_line_with_direction(
                             line.clone().into(),
                             font_size,
                             text_runs,
                             None,
+                            row_direction
+                                .get_or_insert_with(|| {
+                                    if detect_paragraph_direction {
+                                        detect_text_direction(&line)
+                                    } else {
+                                        TextDirection::LeftToRight
+                                    }
+                                })
+                                .to_owned(),
                         );
                         width += shaped_line.width;
                         len += shaped_line.len;
@@ -7715,6 +7768,7 @@ impl LineWithInvisibles {
                             ),
                             point_diagnostics: Vec::new(),
                             font_size,
+                            direction: row_direction.take().unwrap_or_default(),
                         });
 
                         line.clear();
@@ -7943,8 +7997,15 @@ impl LineWithInvisibles {
                     - Pixels::from(scroll_pixel_position.x),
                 line_y,
             );
-        for fragment in &mut self.fragments {
-            match fragment {
+        // Right-to-left rows place their fragments in reverse logical order:
+        // the first logical fragment sits at the right edge of the line.
+        let fragment_indices = if self.direction.is_rtl() {
+            (0..self.fragments.len()).rev()
+        } else {
+            0..self.fragments.len()
+        };
+        for fragment_index in fragment_indices {
+            match &mut self.fragments[fragment_index] {
                 LineFragment::Text(line) => {
                     fragment_origin.x += line.width;
                 }
@@ -8016,10 +8077,33 @@ impl LineWithInvisibles {
         let mut points = points.into_iter().peekable();
         let mut underlines = SmallVec::<[DiagnosticUnderline; 4]>::new();
         let mut diagnostic_ranges = self.diagnostic_underline_severity_ranges.iter().peekable();
-        let mut fragment_start = 0;
         let mut end_underline_offset = layout.point_diagnostic_underline_offset;
 
-        for fragment in &self.fragments {
+        // Right-to-left rows paint their fragments in reverse logical order
+        // (first logical fragment at the right edge). Fragment start offsets
+        // are precomputed in logical order so diagnostic ranges, which are
+        // indexed by logical byte, still resolve correctly.
+        let fragment_logical_starts = self
+            .fragments
+            .iter()
+            .scan(0usize, |start, fragment| {
+                let fragment_start = *start;
+                *start += match fragment {
+                    LineFragment::Text(line) => line.len(),
+                    LineFragment::Element { len, .. } => *len,
+                };
+                Some(fragment_start)
+            })
+            .collect::<SmallVec<[_; 1]>>();
+        let fragment_indices = if self.direction.is_rtl() {
+            (0..self.fragments.len()).rev()
+        } else {
+            0..self.fragments.len()
+        };
+
+        for fragment_index in fragment_indices {
+            let fragment_start = fragment_logical_starts[fragment_index];
+            let fragment = &self.fragments[fragment_index];
             let (fragment_len, fragment_width, line) = match fragment {
                 LineFragment::Text(line) => {
                     if has_points {
@@ -8174,7 +8258,6 @@ impl LineWithInvisibles {
                 }
             }
             fragment_origin.x += fragment_width;
-            fragment_start = fragment_end;
         }
         for diagnostic in points {
             underlines.push(DiagnosticUnderline::point(
@@ -8217,8 +8300,15 @@ impl LineWithInvisibles {
                 line_y,
             );
 
-        for fragment in &self.fragments {
-            match fragment {
+        // Right-to-left rows paint their fragments in reverse logical order,
+        // matching the fragment placement used by the foreground pass.
+        let fragment_indices = if self.direction.is_rtl() {
+            (0..self.fragments.len()).rev()
+        } else {
+            0..self.fragments.len()
+        };
+        for fragment_index in fragment_indices {
+            match &self.fragments[fragment_index] {
                 LineFragment::Text(line) => {
                     line.paint_background(
                         fragment_origin,
@@ -8361,11 +8451,53 @@ impl LineWithInvisibles {
         }
     }
 
-    pub fn x_for_index(&self, index: usize) -> Pixels {
-        let mut fragment_start_x = Pixels::ZERO;
-        let mut fragment_start_index = 0;
+    /// Iterates fragments in visual order, providing each fragment's painted x
+    /// origin and its logical start byte index.
+    ///
+    /// For left-to-right rows fragments are placed in logical order starting
+    /// at x = 0. For right-to-left rows fragments are placed in reverse logical
+    /// order (see [`Self::prepaint_with_custom_offset`]), so the x origin of a
+    /// fragment is the total width minus the widths of all logically-preceding
+    /// fragments.
+    fn fragment_placements(&self) -> impl Iterator<Item = (usize, Pixels, usize)> + '_ {
+        let logical_starts = self
+            .fragments
+            .iter()
+            .scan(0usize, |start, fragment| {
+                let fragment_start = *start;
+                *start += match fragment {
+                    LineFragment::Text(line) => line.len(),
+                    LineFragment::Element { len, .. } => *len,
+                };
+                Some(fragment_start)
+            })
+            .collect::<SmallVec<[_; 1]>>();
 
-        for fragment in &self.fragments {
+        let indices = if self.direction.is_rtl() {
+            (0..self.fragments.len()).rev().collect::<Vec<_>>()
+        } else {
+            (0..self.fragments.len()).collect::<Vec<_>>()
+        };
+        let mut x = Pixels::ZERO;
+
+        indices.into_iter().map(move |fragment_index| {
+            let fragment = &self.fragments[fragment_index];
+            let fragment_start_x = x;
+            x += match fragment {
+                LineFragment::Text(line) => line.width,
+                LineFragment::Element { size, .. } => size.width,
+            };
+            (
+                fragment_index,
+                fragment_start_x,
+                logical_starts[fragment_index],
+            )
+        })
+    }
+
+    pub fn x_for_index(&self, index: usize) -> Pixels {
+        for (_, fragment_start_x, fragment_start_index) in self.fragment_placements() {
+            let fragment = &self.fragments[fragment_index];
             match fragment {
                 LineFragment::Text(shaped_line) => {
                     let fragment_end_index = fragment_start_index + shaped_line.len;
@@ -8373,21 +8505,17 @@ impl LineWithInvisibles {
                         return fragment_start_x
                             + shaped_line.x_for_index(index - fragment_start_index);
                     }
-                    fragment_start_x += shaped_line.width;
-                    fragment_start_index = fragment_end_index;
                 }
                 LineFragment::Element { len, size, .. } => {
                     let fragment_end_index = fragment_start_index + len;
                     if index < fragment_end_index {
                         return fragment_start_x;
                     }
-                    fragment_start_x += size.width;
-                    fragment_start_index = fragment_end_index;
                 }
             }
         }
 
-        fragment_start_x
+        self.width
     }
 
     pub fn x_ranges_for_range(&self, range: Range<usize>) -> SmallVec<[Range<Pixels>; 4]> {
@@ -8396,10 +8524,8 @@ impl LineWithInvisibles {
             return ranges;
         }
 
-        let mut fragment_start_x = Pixels::ZERO;
-        let mut fragment_start_index = 0;
-
-        for fragment in &self.fragments {
+        for (_, fragment_start_x, fragment_start_index) in self.fragment_placements() {
+            let fragment = &self.fragments[fragment_index];
             match fragment {
                 LineFragment::Text(shaped_line) => {
                     let fragment_end_index = fragment_start_index + shaped_line.len;
@@ -8417,8 +8543,6 @@ impl LineWithInvisibles {
                             );
                         }
                     }
-                    fragment_start_x += shaped_line.width;
-                    fragment_start_index = fragment_end_index;
                 }
                 LineFragment::Element { len, size, .. } => {
                     let fragment_end_index = fragment_start_index + len;
@@ -8429,8 +8553,6 @@ impl LineWithInvisibles {
                             fragment_start_x + size.width,
                         );
                     }
-                    fragment_start_x += size.width;
-                    fragment_start_index = fragment_end_index;
                 }
             }
         }
@@ -8460,10 +8582,8 @@ impl LineWithInvisibles {
     }
 
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
-        let mut fragment_start_x = Pixels::ZERO;
-        let mut fragment_start_index = 0;
-
-        for fragment in &self.fragments {
+        for (_, fragment_start_x, fragment_start_index) in self.fragment_placements() {
+            let fragment = &self.fragments[fragment_index];
             match fragment {
                 LineFragment::Text(shaped_line) => {
                     let fragment_end_x = fragment_start_x + shaped_line.width;
@@ -8472,16 +8592,12 @@ impl LineWithInvisibles {
                             fragment_start_index + shaped_line.index_for_x(x - fragment_start_x)?,
                         );
                     }
-                    fragment_start_x = fragment_end_x;
-                    fragment_start_index += shaped_line.len;
                 }
                 LineFragment::Element { len, size, .. } => {
                     let fragment_end_x = fragment_start_x + size.width;
                     if x < fragment_end_x {
                         return Some(fragment_start_index);
                     }
-                    fragment_start_index += len;
-                    fragment_start_x = fragment_end_x;
                 }
             }
         }
@@ -8490,23 +8606,20 @@ impl LineWithInvisibles {
     }
 
     pub fn font_id_for_index(&self, index: usize) -> Option<FontId> {
-        let mut fragment_start_index = 0;
-
-        for fragment in &self.fragments {
+        for (fragment_index, _, fragment_start_index) in self.fragment_placements() {
+            let fragment = &self.fragments[fragment_index];
             match fragment {
                 LineFragment::Text(shaped_line) => {
                     let fragment_end_index = fragment_start_index + shaped_line.len;
                     if index < fragment_end_index {
                         return shaped_line.font_id_for_index(index - fragment_start_index);
                     }
-                    fragment_start_index = fragment_end_index;
                 }
                 LineFragment::Element { len, .. } => {
                     let fragment_end_index = fragment_start_index + len;
                     if index < fragment_end_index {
                         return None;
                     }
-                    fragment_start_index = fragment_end_index;
                 }
             }
         }
@@ -8516,6 +8629,13 @@ impl LineWithInvisibles {
 
     pub fn alignment_offset(&self, text_align: TextAlign, content_width: Pixels) -> Pixels {
         let line_width = self.width;
+        // Right-to-left paragraphs align to the right edge of the editor by
+        // default, mirroring the left alignment used for LTR rows.
+        let text_align = if self.direction.is_rtl() && text_align == TextAlign::Left {
+            TextAlign::Right
+        } else {
+            text_align
+        };
         match text_align {
             TextAlign::Left => px(0.0),
             TextAlign::Center => (content_width - line_width) / 2.0,
@@ -9317,6 +9437,9 @@ impl Element for EditorElement {
                         self.style.background,
                     );
 
+                    let detect_paragraph_direction = language_supports_paragraph_direction(
+                        snapshot.buffer_snapshot().language_at(MultiBufferOffset(0)),
+                    );
                     let mut line_layouts = Self::layout_lines(
                         start_row..end_row,
                         &snapshot,
@@ -9324,6 +9447,7 @@ impl Element for EditorElement {
                         editor_width,
                         is_row_soft_wrapped,
                         &bg_segments_per_row,
+                        detect_paragraph_direction,
                         window,
                         cx,
                     );
@@ -9397,6 +9521,7 @@ impl Element for EditorElement {
                         style,
                         editor_width,
                         is_row_soft_wrapped,
+                        detect_paragraph_direction,
                         window,
                         cx,
                     )
@@ -11121,12 +11246,23 @@ pub(crate) struct BlockLayout {
     pub(crate) is_buffer_header: bool,
 }
 
+/// Whether rows in a buffer with this language should have their paragraph
+/// direction detected automatically from their content.
+///
+/// Programming-language buffers keep left-to-right paragraph layout so that
+/// code structure stays anchored; prose-oriented buffers (plain text and
+/// Markdown) get per-row direction detection.
+pub(crate) fn language_supports_paragraph_direction(language: Option<&Arc<Language>>) -> bool {
+    language.is_none_or(|language| language.name() == "Plain Text" || language.name() == "Markdown")
+}
+
 pub fn layout_line(
     row: DisplayRow,
     snapshot: &EditorSnapshot,
     style: &EditorStyle,
     text_width: Pixels,
     is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
+    detect_paragraph_direction: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> LineWithInvisibles {
@@ -11146,6 +11282,7 @@ pub fn layout_line(
         text_width,
         is_row_soft_wrapped,
         &[],
+        detect_paragraph_direction,
         window,
         cx,
     )
@@ -11617,8 +11754,8 @@ mod tests {
         WindowHandle, font,
     };
     use language::{
-        Buffer, Capability, Diagnostic, DiagnosticEntry, DiagnosticSet, SelectionGoal,
-        language_settings, tree_sitter_python,
+        Buffer, Capability, Diagnostic, DiagnosticEntry, DiagnosticSet, LanguageConfig,
+        LanguageMatcher, SelectionGoal, language_settings, tree_sitter_python,
     };
     use log::info;
     use lsp::DiagnosticSeverity;
@@ -11627,6 +11764,38 @@ mod tests {
     use std::num::NonZeroU32;
     use text::PointUtf16;
     use util::test::sample_text;
+
+    #[test]
+    fn test_language_supports_paragraph_direction() {
+        fn language_named(name: &str) -> Arc<Language> {
+            Arc::new(Language::new(
+                LanguageConfig {
+                    name: name.into(),
+                    matcher: LanguageMatcher {
+                        path_suffixes: vec![".test-extension".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+            ))
+        }
+
+        // Prose-oriented buffers (and buffers without a language) get
+        // automatic paragraph direction detection.
+        assert!(language_supports_paragraph_direction(None));
+        assert!(language_supports_paragraph_direction(Some(
+            &language_named("Plain Text")
+        )));
+        assert!(language_supports_paragraph_direction(Some(
+            &language_named("Markdown")
+        )));
+
+        // Programming-language buffers stay left-to-right.
+        assert!(!language_supports_paragraph_direction(Some(
+            &language_named("Rust")
+        )));
+    }
 
     // Regression test for https://github.com/zed-industries/zed/issues/65453.
     #[gpui::test]
@@ -13495,6 +13664,7 @@ mod tests {
                     px(500.),
                     |_| false,
                     &[],
+                    false,
                     window,
                     cx,
                 );
@@ -14129,6 +14299,7 @@ mod tests {
             len: 1,
             width: px(3.25),
             font_size: px(13.),
+            direction: TextDirection::LeftToRight,
         };
         let underline = point_diagnostic_test_style(WARNING);
         line.add_point_diagnostic(PointDiagnostic {

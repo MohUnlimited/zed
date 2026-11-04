@@ -209,7 +209,15 @@ impl PlatformTextSystem for AppleTextSystem {
         self.0.read().rasterize_glyph(glyph_id, raster_bounds)
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+        _direction: gpui::TextDirection,
+    ) -> LineLayout {
+        // CoreText-based shaping keeps left-to-right paragraph layout; the
+        // requested base direction is ignored and reported as LTR.
         self.0.write().layout_line(text, font_size, font_runs)
     }
 
@@ -634,6 +642,7 @@ impl AppleTextSystemState {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: gpui::TextDirection::LeftToRight,
         }
     }
 }

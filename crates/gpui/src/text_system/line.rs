@@ -1,7 +1,7 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
-    WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
+    SharedString, StrikethroughStyle, TextAlign, TextDirection, UnderlineStyle, Window,
+    WrapBoundary, WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -110,6 +110,7 @@ impl ShapedLine {
             } else {
                 Vec::new()
             },
+            direction: layout.direction,
         });
         self
     }
@@ -387,6 +388,7 @@ impl<'a> ShapedLineCursor<'a> {
                 len: byte_index - previous_index,
                 index_positions: Vec::new(),
                 visual_index_positions: Vec::new(),
+                direction: self.line.layout.direction,
             }),
             text: SharedString::new(&self.line.text[previous_index..byte_index]),
             decoration_runs: decorations,
@@ -1095,6 +1097,7 @@ mod tests {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: TextDirection::LeftToRight,
         };
         layout.compute_bidi_index_positions(text);
 
@@ -1610,6 +1613,7 @@ mod tests {
                 len: 6,
                 index_positions: Vec::new(),
                 visual_index_positions: Vec::new(),
+                direction: TextDirection::LeftToRight,
             }),
             text: "abcdef".into(),
             decoration_runs: SmallVec::new(),
@@ -1784,6 +1788,7 @@ mod tests {
             len: layout.len,
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: layout.direction,
         });
         line
     }
@@ -1854,6 +1859,7 @@ mod tests {
                 len: 10,
                 index_positions: Vec::new(),
                 visual_index_positions: Vec::new(),
+                direction: TextDirection::LeftToRight,
             }),
             text: "a😀bcdef".into(),
             decoration_runs: SmallVec::new(),

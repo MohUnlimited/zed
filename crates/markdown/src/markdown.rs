@@ -37,8 +37,8 @@ use gpui::{
     ImageFormat, ImageSource, InputHandler, KeyContext, Length, MouseButton, MouseDownEvent,
     MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, Stateful,
     StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
-    TextLayout, TextRun, TextStyle, TextStyleRefinement, UTF16Selection, WrappedLineLayout,
-    actions, canvas, img, point, quad, relative, size,
+    TextDirection, TextLayout, TextRun, TextStyle, TextStyleRefinement, UTF16Selection,
+    WrappedLineLayout, actions, canvas, detect_text_direction, img, point, quad, relative, size,
 };
 use language::{
     Bias, CharClassifier, Language, LanguageRegistry, OffsetUtf16, ResolvedHighlights, Rope,
@@ -2778,7 +2778,12 @@ impl Element for MarkdownElement {
                             let text_align_override = builder
                                 .table
                                 .current_cell_alignment()
-                                .and_then(alignment_to_text_align);
+                                .and_then(alignment_to_text_align)
+                                .or_else(|| {
+                                    paragraph_direction_text_align(
+                                        &parsed_markdown.source[range.clone()],
+                                    )
+                                });
                             self.push_markdown_paragraph(
                                 &mut builder,
                                 range,
@@ -2790,7 +2795,12 @@ impl Element for MarkdownElement {
                             let text_align_override = builder
                                 .table
                                 .current_cell_alignment()
-                                .and_then(alignment_to_text_align);
+                                .and_then(alignment_to_text_align)
+                                .or_else(|| {
+                                    paragraph_direction_text_align(
+                                        &parsed_markdown.source[range.clone()],
+                                    )
+                                });
                             self.push_markdown_heading(
                                 &mut builder,
                                 *level,
@@ -3789,6 +3799,17 @@ fn alignment_to_text_align(alignment: Alignment) -> Option<TextAlign> {
     }
 }
 
+/// Returns the text alignment for a block of prose based on its detected base
+/// direction: right-to-left paragraphs align to the right, everything else
+/// keeps the default alignment (`None`).
+fn paragraph_direction_text_align(text: &str) -> Option<TextAlign> {
+    if detect_text_direction(text).is_rtl() {
+        Some(TextAlign::Right)
+    } else {
+        None
+    }
+}
+
 // The contents of loose list items are wrapped in a paragraph, so their task
 // marker follows `Start(Paragraph)` rather than `Start(Item)`.
 fn task_list_marker_for_item(
@@ -4360,7 +4381,25 @@ impl MarkdownElementBuilder {
                     .highlights_for_line(first_mapping.source_index..self.current_source_index)
             })
             .unwrap_or_default();
-        let text = StyledText::new(line.text).with_runs(line.runs);
+        // Code blocks always keep left-to-right paragraph layout; prose gets
+        // its base direction detected from the rendered text so that
+        // Persian/Arabic-dominant paragraphs shape with an RTL embedding
+        // level while English prose stays LTR.
+        let direction = if self.code_block_stack.last().is_some() {
+            TextDirection::LeftToRight
+        } else {
+            detect_text_direction(&line.text)
+        };
+        // Right-to-left paragraphs align to the right unless the paragraph
+        // was given an explicit (non-default) alignment.
+        let text_align = if direction.is_rtl() && text_align == TextAlign::Left {
+            TextAlign::Right
+        } else {
+            text_align
+        };
+        let text = StyledText::new(line.text)
+            .with_runs(line.runs)
+            .with_direction(direction);
         let rendered_line = Rc::new(RenderedLine {
             layout: text.layout().clone(),
             visible_bounds: Cell::new(None),
@@ -7938,6 +7977,56 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_paragraph_direction_follows_content(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let style = {
+            let window = cx.add_empty_window();
+            window.update(|window, cx| MarkdownStyle::themed(MarkdownFont::Preview, window, cx))
+        };
+
+        let markdown = cx.new(|cx| {
+            Markdown::new(
+                indoc::indoc! {r#"
+                    Persian first
+
+                    Zed بهترین ویرایشگر است
+
+                    A paragraph that mentions یک کلمه of Persian stays LTR.
+
+                    # عنوان فارسی
+
+                    ```
+                    کد در بلاک کد
+                    ```
+                "#}
+                .into(),
+                None,
+                None,
+                cx,
+            )
+        });
+        let rendered = render_markdown_entity_in_view(markdown, style, None, None, cx);
+
+        let alignments = rendered
+            .lines
+            .iter()
+            .map(|line| line.text_align)
+            .collect::<Vec<_>>();
+
+        // English prose stays left-aligned.
+        assert_eq!(alignments[0], TextAlign::Left);
+        // A Persian-dominant paragraph that starts with an English product
+        // name is still detected as right-to-left.
+        assert_eq!(alignments[1], TextAlign::Right);
+        // An English-dominant paragraph with a single Persian word stays LTR.
+        assert_eq!(alignments[2], TextAlign::Left);
+        // Headings follow the same detection as paragraphs.
+        assert_eq!(alignments[3], TextAlign::Right);
+        // Fenced code blocks always keep left-to-right layout.
+        assert_eq!(alignments[4], TextAlign::Left);
+    }
+
+    #[gpui::test]
     fn test_wide_table_scrolls_horizontally(cx: &mut TestAppContext) {
         ensure_theme_initialized(cx);
         let source = indoc::indoc! {r#"
@@ -9118,12 +9207,19 @@ mod tests {
             self.text_system.rasterize_glyph(params, raster_bounds)
         }
 
-        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+        fn layout_line(
+            &self,
+            text: &str,
+            font_size: Pixels,
+            runs: &[FontRun],
+            direction: gpui::TextDirection,
+        ) -> LineLayout {
             self.shaped_lines
                 .lock()
                 .expect("shaped lines lock should not be poisoned")
                 .push((text.to_string(), runs.iter().map(|run| run.len).collect()));
-            self.text_system.layout_line(text, font_size, runs)
+            self.text_system
+                .layout_line(text, font_size, runs, direction)
         }
 
         fn recommended_rendering_mode(

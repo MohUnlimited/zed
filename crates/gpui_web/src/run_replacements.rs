@@ -388,6 +388,7 @@ mod tests {
             len: index * 2,
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: gpui::TextDirection::LeftToRight,
         }
     }
 

@@ -14,6 +14,7 @@ use std::{
 use unicode_bidi::BidiInfo;
 
 use super::LineWrapper;
+use super::direction::TextDirection;
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -34,6 +35,12 @@ pub struct LineLayout {
     pub index_positions: Vec<IndexPosition>,
     /// Bidi-aware caret stops, sorted by visual x position.
     pub visual_index_positions: Vec<IndexPosition>,
+    /// The base text direction that was used to shape this line.
+    ///
+    /// This records the paragraph embedding level the platform text system
+    /// actually applied, which can differ from a requested direction on
+    /// platforms that do not support right-to-left paragraph layout.
+    pub direction: TextDirection,
 }
 
 /// A caret stop for a logical UTF-8 byte index.
@@ -313,13 +320,11 @@ impl LineLayout {
             return;
         }
 
-        // The platform text systems shape editor lines with a left-to-right
-        // paragraph base direction (DirectWrite always uses an LTR base), so
-        // resolve the Unicode bidi algorithm against an LTR paragraph as well.
-        // RTL runs are laid out right-to-left within that base, and every
-        // caret stop below takes its x position from the shaped glyphs, so the
-        // mapping stays consistent with what was rendered.
-        let bidi_info = BidiInfo::new(text, Some(unicode_bidi::Level::ltr()));
+        // Resolve the Unicode bidi algorithm against the same paragraph base
+        // direction the platform text system used for shaping (`self.direction`),
+        // so that every caret stop below maps consistently with what was
+        // rendered.
+        let bidi_info = BidiInfo::new(text, Some(self.direction.bidi_level()));
         if !bidi_info.has_rtl() {
             return;
         }
@@ -572,9 +577,7 @@ impl LineLayout {
             }
             let glyph_right = glyph_edges
                 .get(next_ix)
-                .map_or(self.width, |(_, _, next_glyph)| {
-                    next_glyph.position.x
-                });
+                .map_or(self.width, |(_, _, next_glyph)| next_glyph.position.x);
             let glyph_width = glyph_right - glyph_left;
             let glyph_group = &glyph_edges[ix..next_ix];
 
@@ -662,6 +665,7 @@ impl LineLayout {
             len: byte_index,
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: self.direction,
         };
 
         let right = LineLayout {
@@ -673,6 +677,7 @@ impl LineLayout {
             len: self.len - byte_index,
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: self.direction,
         };
 
         (left, right)
@@ -1339,7 +1344,7 @@ impl LineLayoutCache {
         let text = materialize_text();
         let mut layout = self
             .platform_text_system
-            .layout_line(&text, font_size, runs);
+            .layout_line(&text, font_size, runs, direction);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -1446,6 +1451,7 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    direction: TextDirection,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -1455,6 +1461,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    direction: TextDirection,
 }
 
 #[derive(Clone, Debug)]
@@ -1465,6 +1472,7 @@ struct HashedCacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    direction: TextDirection,
 }
 
 #[derive(Copy, Clone)]
@@ -1475,6 +1483,7 @@ struct HashedCacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    direction: TextDirection,
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
@@ -1491,6 +1500,7 @@ impl PartialEq for HashedCacheKey {
             && self.runs.as_slice() == other.runs.as_slice()
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.direction == other.direction
     }
 }
 
@@ -1504,6 +1514,7 @@ impl Hash for HashedCacheKey {
         self.runs.as_slice().hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.direction.hash(state);
     }
 }
 
@@ -1515,6 +1526,7 @@ impl PartialEq for HashedCacheKeyRef<'_> {
             && self.runs == other.runs
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.direction == other.direction
     }
 }
 
@@ -1528,6 +1540,7 @@ impl Hash for HashedCacheKeyRef<'_> {
         self.runs.hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.direction.hash(state);
     }
 }
 
@@ -1547,6 +1560,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            direction: self.direction,
         }
     }
 }
@@ -1602,6 +1616,7 @@ mod tests {
             len: 0,
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: TextDirection::LeftToRight,
         }
     }
 
@@ -1611,6 +1626,63 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn test_bidi_index_positions_rtl_base_mixed_line() {
+        // "abc אבג" shaped with an RTL paragraph base direction: the Hebrew
+        // run is placed at the left edge of the line (reading right-to-left)
+        // and the Latin run ends up at the right edge. Glyph x positions
+        // mirror what DirectWrite produces for such a line.
+        let text = "abc אבג";
+        let mut layout = LineLayout {
+            font_size: px(16.),
+            width: px(70.),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    glyph_at(0., 8),  // ג
+                    glyph_at(10., 6), // ב
+                    glyph_at(20., 4), // א
+                    glyph_at(30., 3), // space
+                    glyph_at(40., 0), // a
+                    glyph_at(50., 1), // b
+                    glyph_at(60., 2), // c
+                ],
+            }],
+            len: text.len(),
+            index_positions: Vec::new(),
+            visual_index_positions: Vec::new(),
+            direction: TextDirection::RightToLeft,
+        };
+
+        layout.compute_bidi_index_positions(text);
+
+        // The paragraph reads from the right: the first logical index (start
+        // of the Latin run) sits at the right side of the line.
+        assert_eq!(layout.x_for_index(0), px(40.));
+        assert_eq!(layout.x_for_index(1), px(50.));
+        assert_eq!(layout.x_for_index(2), px(60.));
+        assert_eq!(layout.x_for_index(3), px(70.));
+        // The Hebrew run reads right-to-left from x=30 down to the left edge.
+        assert_eq!(layout.x_for_index(4), px(30.));
+        assert_eq!(layout.x_for_index(6), px(20.));
+        assert_eq!(layout.x_for_index(8), px(10.));
+        assert_eq!(layout.x_for_index(10), px(0.));
+
+        assert_eq!(layout.index_for_x(px(45.)), Some(0));
+        assert_eq!(layout.index_for_x(px(15.)), Some(6));
+
+        assert_eq!(
+            layout.x_ranges_for_range(0..3).as_slice(),
+            [px(40.)..px(70.)]
+        );
+        assert_eq!(
+            layout.x_ranges_for_range(4..10).as_slice(),
+            [px(0.)..px(30.)]
+        );
     }
 
     #[test]
@@ -1711,6 +1783,7 @@ mod tests {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: TextDirection::LeftToRight,
         };
 
         layout.compute_bidi_index_positions(text);
@@ -1766,6 +1839,7 @@ mod tests {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: TextDirection::LeftToRight,
         };
 
         layout.compute_bidi_index_positions(text);
@@ -1798,6 +1872,7 @@ mod tests {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: TextDirection::LeftToRight,
         };
         layout.compute_bidi_index_positions(text);
 
@@ -1991,6 +2066,7 @@ mod tests {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: TextDirection::LeftToRight,
         };
 
         layout.compute_bidi_index_positions(text);

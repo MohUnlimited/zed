@@ -286,10 +286,16 @@ impl PlatformTextSystem for DirectWriteTextSystem {
             .rasterize_glyph(&self.components, params, raster_bounds)
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        direction: TextDirection,
+    ) -> LineLayout {
         self.state
             .write()
-            .layout_line(&self.components, text, font_size, runs)
+            .layout_line(&self.components, text, font_size, runs, direction)
             .log_err()
             .unwrap_or(LineLayout {
                 font_size,
@@ -527,6 +533,7 @@ impl DirectWriteState {
         text: &str,
         font_size: Pixels,
         font_runs: &[FontRun],
+        direction: TextDirection,
     ) -> Result<LineLayout> {
         if font_runs.is_empty() {
             return Ok(LineLayout {
@@ -564,6 +571,14 @@ impl DirectWriteState {
                     // glyphs (e.g. Arabic or Persian) resolve on all Windows setups.
                     let system_fallbacks = components.factory.GetSystemFontFallback()?;
                     format.SetFontFallback(&system_fallbacks)?;
+                }
+
+                // DirectWrite performs the UAX #9 bidirectional analysis inside
+                // `IDWriteTextLayout` using the format's reading direction as the
+                // paragraph embedding level, so an RTL base direction must be
+                // set here for right-to-left paragraphs.
+                if direction.is_rtl() {
+                    format.SetReadingDirection(DWRITE_READING_DIRECTION_RTL)?;
                 }
 
                 let layout = components.factory.CreateTextLayout(
@@ -647,6 +662,7 @@ impl DirectWriteState {
                 len: text.len(),
                 index_positions: Vec::new(),
                 visual_index_positions: Vec::new(),
+                direction,
             })
         }
     }

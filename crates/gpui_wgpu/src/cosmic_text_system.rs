@@ -270,7 +270,15 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.write().rasterize_glyph(params, raster_bounds)
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        _direction: gpui::TextDirection,
+    ) -> LineLayout {
+        // cosmic-text-based shaping keeps left-to-right paragraph layout; the
+        // requested base direction is ignored and reported as LTR.
         self.0.write().layout_line(text, font_size, runs)
     }
 
@@ -775,6 +783,7 @@ impl CosmicTextSystemState {
                 len: text.len(),
                 index_positions: Vec::new(),
                 visual_index_positions: Vec::new(),
+                direction: gpui::TextDirection::LeftToRight,
             };
         };
 
@@ -849,6 +858,7 @@ impl CosmicTextSystemState {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: gpui::TextDirection::LeftToRight,
         }
     }
 
@@ -1370,7 +1380,12 @@ mod tests {
             len: text.len(),
             font_id,
         }];
-        Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
+        Ok(text_system.layout_line(
+            text,
+            gpui::px(14.0),
+            &runs,
+            gpui::TextDirection::LeftToRight,
+        ))
     }
 
     /// Mirrors the original crash: mixed-direction text reaching the shaper
@@ -1576,7 +1591,12 @@ mod tests {
                 font_id,
             },
         ];
-        let layout = text_system.layout_line(text, gpui::px(14.0), &runs);
+        let layout = text_system.layout_line(
+            text,
+            gpui::px(14.0),
+            &runs,
+            gpui::TextDirection::LeftToRight,
+        );
 
         assert_eq!(layout.len, text.len());
         assert!(layout.width > Pixels::ZERO);

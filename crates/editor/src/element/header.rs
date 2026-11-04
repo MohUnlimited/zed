@@ -28,8 +28,8 @@ use util::ResultExt;
 use workspace::{ItemHandle, ItemSettings, OpenInTerminal, OpenTerminal, RevealInProjectPanel};
 
 use super::{
-    BlockLayout, EditorElement, EditorLayout, LineWithInvisibles, layout_line,
-    render_breadcrumb_text,
+    BlockLayout, EditorElement, EditorLayout, LineWithInvisibles,
+    language_supports_paragraph_direction, layout_line, render_breadcrumb_text,
 };
 use crate::{
     BUFFER_HEADER_PADDING, DisplayRow, Editor, EditorSettings, EditorSnapshot, FILE_HEADER_HEIGHT,
@@ -262,6 +262,11 @@ impl EditorElement {
                 &self.style,
                 editor_width,
                 is_row_soft_wrapped,
+                language_supports_paragraph_direction(
+                    snapshot
+                        .buffer_snapshot()
+                        .language_at(multi_buffer::MultiBufferOffset(0)),
+                ),
                 window,
                 cx,
             );
