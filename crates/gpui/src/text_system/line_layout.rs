@@ -521,6 +521,7 @@ impl LineLayout {
             len: byte_index,
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: self.direction,
         };
 
         let right = LineLayout {
@@ -532,6 +533,7 @@ impl LineLayout {
             len: self.len - byte_index,
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: self.direction,
         };
 
         (left, right)
@@ -1097,6 +1099,7 @@ impl LineLayoutCache {
         text: Text,
         font_size: Pixels,
         runs: &[FontRun],
+        direction: TextDirection,
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
     ) -> Arc<WrappedLineLayout>
@@ -1111,6 +1114,7 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            direction,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -1129,7 +1133,8 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let unwrapped_layout =
+                self.layout_line::<&SharedString>(&text, font_size, runs, direction, None);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
             } else {
@@ -1146,6 +1151,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                direction,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -1163,6 +1169,7 @@ impl LineLayoutCache {
         text: Text,
         font_size: Pixels,
         runs: &[FontRun],
+        direction: TextDirection,
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout>
     where
@@ -1176,6 +1183,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            direction,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -1192,7 +1200,7 @@ impl LineLayoutCache {
             let text = SharedString::from(text);
             let mut layout = self
                 .platform_text_system
-                .layout_line(&text, font_size, runs);
+                .layout_line(&text, font_size, runs, direction);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -1205,6 +1213,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                direction,
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -1227,6 +1236,7 @@ impl LineLayoutCache {
         text_len: usize,
         font_size: Pixels,
         runs: &[FontRun],
+        direction: TextDirection,
         force_width: Option<Pixels>,
     ) -> Option<Arc<LineLayout>> {
         let _font_generation = self.clear_if_font_generation_changed();
@@ -1237,6 +1247,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            direction,
         };
 
         let current_frame = self.current_frame.read();
@@ -1248,6 +1259,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                direction: key.direction,
             } == key_ref
         }) {
             return Some(layout.clone());
@@ -1262,6 +1274,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                direction: key.direction,
             } == key_ref
         }) {
             return Some(layout.clone());
@@ -1284,6 +1297,7 @@ impl LineLayoutCache {
         text_len: usize,
         font_size: Pixels,
         runs: &[FontRun],
+        direction: TextDirection,
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
@@ -1295,6 +1309,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            direction,
         };
 
         // Fast path: already cached (no allocation).
@@ -1307,6 +1322,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                direction: key.direction,
             } == key_ref
         }) {
             return layout.clone();
@@ -1328,6 +1344,7 @@ impl LineLayoutCache {
                     runs: key.runs.as_slice(),
                     wrap_width: key.wrap_width,
                     force_width: key.force_width,
+                    direction: key.direction,
                 } == key_ref
             })
             .cloned()
@@ -1358,6 +1375,7 @@ impl LineLayoutCache {
             runs: SmallVec::from(runs),
             wrap_width: None,
             force_width,
+            direction,
         });
         let layout = Arc::new(layout);
         current_frame
@@ -1940,6 +1958,7 @@ mod tests {
                 len: text.len(),
                 index_positions: Vec::new(),
                 visual_index_positions: Vec::new(),
+                direction: TextDirection::LeftToRight,
             };
 
             layout.compute_bidi_index_positions(text);
@@ -1991,6 +2010,7 @@ mod tests {
             len: text.len(),
             index_positions: Vec::new(),
             visual_index_positions: Vec::new(),
+            direction: TextDirection::LeftToRight,
         };
 
         layout.compute_bidi_index_positions(text);

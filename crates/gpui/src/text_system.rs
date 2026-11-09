@@ -427,6 +427,7 @@ impl TextSystem {
                     len: buffer.len(),
                     font_id,
                 }],
+                TextDirection::LeftToRight,
             )
             .width
     }
@@ -780,6 +781,7 @@ impl WindowTextSystem {
             text_len,
             font_size,
             runs,
+            TextDirection::LeftToRight,
             used_force_width,
             || {
                 let text = materialize_text();
@@ -1079,6 +1081,7 @@ impl WindowTextSystem {
         text_len: usize,
         font_size: Pixels,
         runs: &[TextRun],
+        direction: TextDirection,
         force_width: Option<Pixels>,
     ) -> Option<Arc<LineLayout>> {
         let mut last_run = None::<&TextRun>;
@@ -1118,6 +1121,7 @@ impl WindowTextSystem {
             text_len,
             font_size,
             &font_runs,
+            direction,
             force_width,
         );
 
