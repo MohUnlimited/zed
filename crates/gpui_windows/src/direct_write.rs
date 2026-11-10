@@ -578,7 +578,7 @@ impl DirectWriteState {
                 // paragraph embedding level, so an RTL base direction must be
                 // set here for right-to-left paragraphs.
                 if direction.is_rtl() {
-                    format.SetReadingDirection(DWRITE_READING_DIRECTION_RTL)?;
+                    format.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT)?;
                 }
 
                 let layout = components.factory.CreateTextLayout(
@@ -2000,7 +2000,10 @@ mod tests {
 
     #[test]
     fn test_cluster_map_handles_rtl_clusters() {
-        assert_eq!(glyph_utf16_start_indices(&[4, 3, 2, 1, 0], 5), [4, 3, 2, 1, 0]);
+        assert_eq!(
+            glyph_utf16_start_indices(&[4, 3, 2, 1, 0], 5),
+            [4, 3, 2, 1, 0]
+        );
         assert_eq!(glyph_utf16_start_indices(&[2, 2, 0], 3), [2, 2, 0]);
     }
 
