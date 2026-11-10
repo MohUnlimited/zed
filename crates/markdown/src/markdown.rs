@@ -2790,6 +2790,11 @@ impl Element for MarkdownElement {
                                 markdown_end,
                                 text_align_override,
                             );
+                            // The base direction is decided once per paragraph so
+                            // that all of its lines share one embedding level.
+                            builder.paragraph_direction = Some(detect_text_direction(
+                                &parsed_markdown.source[range.clone()],
+                            ));
                         }
                         MarkdownTag::Heading { level, .. } => {
                             let text_align_override = builder
@@ -2808,6 +2813,9 @@ impl Element for MarkdownElement {
                                 markdown_end,
                                 text_align_override,
                             );
+                            builder.paragraph_direction = Some(detect_text_direction(
+                                &parsed_markdown.source[range.clone()],
+                            ));
                         }
                         MarkdownTag::BlockQuote(kind) => {
                             self.push_markdown_block_quote(
@@ -3194,9 +3202,11 @@ impl Element for MarkdownElement {
                     }
                     MarkdownTagEnd::Paragraph => {
                         self.pop_markdown_paragraph(&mut builder);
+                        builder.paragraph_direction = None;
                     }
                     MarkdownTagEnd::Heading(_) => {
                         self.pop_markdown_heading(&mut builder);
+                        builder.paragraph_direction = None;
                     }
                     MarkdownTagEnd::BlockQuote(_kind) => {
                         self.pop_markdown_block_quote(&mut builder);
@@ -3852,6 +3862,10 @@ struct MarkdownElementBuilder {
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
     highlights: MarkdownHighlights,
+    /// The base direction of the paragraph currently being rendered. Set when
+    /// a paragraph or heading starts so that every line of the paragraph
+    /// shares one base direction, as required by UAX #9.
+    paragraph_direction: Option<TextDirection>,
 }
 
 struct MarkdownHighlights {
@@ -3971,6 +3985,7 @@ impl MarkdownElementBuilder {
             table: TableState::default(),
             syntax_theme,
             highlights,
+            paragraph_direction: None,
         }
     }
 
@@ -4384,11 +4399,14 @@ impl MarkdownElementBuilder {
         // Code blocks always keep left-to-right paragraph layout; prose gets
         // its base direction detected from the rendered text so that
         // Persian/Arabic-dominant paragraphs shape with an RTL embedding
-        // level while English prose stays LTR.
+        // level while English prose stays LTR. When the paragraph's base
+        // direction is already known, it wins over the per-line detection so
+        // that all lines of a paragraph agree on the embedding level.
         let direction = if self.code_block_stack.last().is_some() {
             TextDirection::LeftToRight
         } else {
-            detect_text_direction(&line.text)
+            self.paragraph_direction
+                .unwrap_or_else(|| detect_text_direction(&line.text))
         };
         // Right-to-left paragraphs align to the right unless the paragraph
         // was given an explicit (non-default) alignment.
@@ -7995,6 +8013,13 @@ mod tests {
 
                     # عنوان فارسی
 
+                    این یک پاراگراف فارسی درباره ویرایشگرهای متنی صحبت می‌کند
+                    Zed
+
+                    This is an English paragraph about text editors and the way
+                    they render documents
+                    فارسی
+
                     ```
                     کد در بلاک کد
                     ```
@@ -8022,8 +8047,14 @@ mod tests {
         assert_eq!(alignments[2], TextAlign::Left);
         // Headings follow the same detection as paragraphs.
         assert_eq!(alignments[3], TextAlign::Right);
+        // A paragraph is detected as a whole, so a Persian-dominant paragraph
+        // that mentions an English product name stays right-aligned.
+        assert_eq!(alignments[4], TextAlign::Right);
+        // An English-dominant paragraph that mentions a Persian word stays
+        // left-aligned.
+        assert_eq!(alignments[5], TextAlign::Left);
         // Fenced code blocks always keep left-to-right layout.
-        assert_eq!(alignments[4], TextAlign::Left);
+        assert_eq!(alignments[6], TextAlign::Left);
     }
 
     #[gpui::test]

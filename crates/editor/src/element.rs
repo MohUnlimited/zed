@@ -8000,9 +8000,11 @@ impl LineWithInvisibles {
         // Right-to-left rows place their fragments in reverse logical order:
         // the first logical fragment sits at the right edge of the line.
         let fragment_indices = if self.direction.is_rtl() {
-            (0..self.fragments.len()).rev()
+            (0..self.fragments.len())
+                .rev()
+                .collect::<SmallVec<[_; 4]>>()
         } else {
-            0..self.fragments.len()
+            (0..self.fragments.len()).collect::<SmallVec<[_; 4]>>()
         };
         for fragment_index in fragment_indices {
             match &mut self.fragments[fragment_index] {
@@ -8096,9 +8098,11 @@ impl LineWithInvisibles {
             })
             .collect::<SmallVec<[_; 1]>>();
         let fragment_indices = if self.direction.is_rtl() {
-            (0..self.fragments.len()).rev()
+            (0..self.fragments.len())
+                .rev()
+                .collect::<SmallVec<[_; 4]>>()
         } else {
-            0..self.fragments.len()
+            (0..self.fragments.len()).collect::<SmallVec<[_; 4]>>()
         };
 
         for fragment_index in fragment_indices {
@@ -8303,9 +8307,11 @@ impl LineWithInvisibles {
         // Right-to-left rows paint their fragments in reverse logical order,
         // matching the fragment placement used by the foreground pass.
         let fragment_indices = if self.direction.is_rtl() {
-            (0..self.fragments.len()).rev()
+            (0..self.fragments.len())
+                .rev()
+                .collect::<SmallVec<[_; 4]>>()
         } else {
-            0..self.fragments.len()
+            (0..self.fragments.len()).collect::<SmallVec<[_; 4]>>()
         };
         for fragment_index in fragment_indices {
             match &self.fragments[fragment_index] {
@@ -8496,7 +8502,7 @@ impl LineWithInvisibles {
     }
 
     pub fn x_for_index(&self, index: usize) -> Pixels {
-        for (_, fragment_start_x, fragment_start_index) in self.fragment_placements() {
+        for (fragment_index, fragment_start_x, fragment_start_index) in self.fragment_placements() {
             let fragment = &self.fragments[fragment_index];
             match fragment {
                 LineFragment::Text(shaped_line) => {
@@ -8524,7 +8530,7 @@ impl LineWithInvisibles {
             return ranges;
         }
 
-        for (_, fragment_start_x, fragment_start_index) in self.fragment_placements() {
+        for (fragment_index, fragment_start_x, fragment_start_index) in self.fragment_placements() {
             let fragment = &self.fragments[fragment_index];
             match fragment {
                 LineFragment::Text(shaped_line) => {
@@ -8582,7 +8588,7 @@ impl LineWithInvisibles {
     }
 
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
-        for (_, fragment_start_x, fragment_start_index) in self.fragment_placements() {
+        for (fragment_index, fragment_start_x, fragment_start_index) in self.fragment_placements() {
             let fragment = &self.fragments[fragment_index];
             match fragment {
                 LineFragment::Text(shaped_line) => {
@@ -11795,6 +11801,85 @@ mod tests {
         assert!(!language_supports_paragraph_direction(Some(
             &language_named("Rust")
         )));
+    }
+
+    #[gpui::test]
+    fn test_row_direction_follows_content_and_buffer_language(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        fn row_directions(
+            editor: &Editor,
+            row_count: usize,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Vec<TextDirection> {
+            let snapshot = editor.snapshot(window, cx);
+            let style = editor.create_style(cx);
+            let detect_paragraph_direction = language_supports_paragraph_direction(
+                snapshot.buffer_snapshot().language_at(MultiBufferOffset(0)),
+            );
+            let mut directions = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                let line = layout_line(
+                    DisplayRow(row as u32),
+                    &snapshot,
+                    &style,
+                    px(500.),
+                    |_| false,
+                    detect_paragraph_direction,
+                    window,
+                    cx,
+                );
+                directions.push(line.direction);
+            }
+            directions
+        }
+
+        // Prose buffers detect their direction from the content of each row.
+        let prose = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(
+                "سلام دنیا\nThe quick brown fox\nZed بهترین ویرایشگر کد است\n",
+                cx,
+            );
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        prose
+            .update(cx, |editor, window, cx| {
+                assert_eq!(
+                    row_directions(editor, 3, window, cx),
+                    vec![
+                        TextDirection::RightToLeft,
+                        TextDirection::LeftToRight,
+                        TextDirection::RightToLeft,
+                    ]
+                );
+            })
+            .expect("checked prose row directions");
+
+        // Source code keeps left-to-right rows even when a comment contains
+        // right-to-left text.
+        let code_buffer = cx.new(|cx| {
+            let buffer = Buffer::local("fn main() {}\n// سلام دنیا\n", cx);
+            buffer.set_language(Some(languages::rust_lang()), cx);
+            buffer
+        });
+        let code_multibuffer = cx.new(|cx| MultiBuffer::singleton(code_buffer.clone(), cx));
+        let code = cx.add_window(|window, cx| {
+            Editor::new(
+                EditorMode::full(),
+                code_multibuffer.clone(),
+                None,
+                window,
+                cx,
+            )
+        });
+        code.update(cx, |editor, window, cx| {
+            assert_eq!(
+                row_directions(editor, 2, window, cx),
+                vec![TextDirection::LeftToRight, TextDirection::LeftToRight]
+            );
+        })
+        .expect("checked code row directions");
     }
 
     // Regression test for https://github.com/zed-industries/zed/issues/65453.
