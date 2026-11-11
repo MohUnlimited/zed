@@ -26,6 +26,14 @@ use windows_numerics::Vector2;
 use crate::*;
 use gpui::*;
 
+/// Width of the layout box used for right-to-left paragraphs.
+///
+/// DirectWrite aligns right-to-left paragraphs against the right edge of the
+/// layout box, so the box has to have a finite width. The value only exists to
+/// keep the run origins finite; the runs are moved back to the left edge after
+/// they have been collected.
+const RTL_LAYOUT_WIDTH: f32 = 1024.0;
+
 #[derive(Debug)]
 struct FontInfo {
     font_family_h: HSTRING,
@@ -577,14 +585,27 @@ impl DirectWriteState {
                 // `IDWriteTextLayout` using the format's reading direction as the
                 // paragraph embedding level, so an RTL base direction must be
                 // set here for right-to-left paragraphs.
-                if direction.is_rtl() {
+                //
+                // A right-to-left paragraph is aligned against the right edge of
+                // the layout box, so the box needs a finite width: with an
+                // infinite width DirectWrite derives the run origins from
+                // `infinity - line width`, which places every glyph at an
+                // infinite offset and renders the line invisible. The runs are
+                // moved back to the left edge once they have been collected.
+                // Word wrapping is disabled because line breaking is handled by
+                // gpui, not by DirectWrite.
+                let max_width = if direction.is_rtl() {
                     format.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT)?;
-                }
+                    format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                    RTL_LAYOUT_WIDTH
+                } else {
+                    f32::INFINITY
+                };
 
                 let layout = components.factory.CreateTextLayout(
                     text_wide,
                     &format,
-                    f32::INFINITY,
+                    max_width,
                     f32::INFINITY,
                 )?;
                 let current_text = &text[utf8_offset..(utf8_offset + first_run.len)];
@@ -643,7 +664,8 @@ impl DirectWriteState {
                 components,
                 index_converter: StringIndexConverter::new(text),
                 runs: &mut runs,
-                width: 0.0,
+                left: f32::INFINITY,
+                right: f32::NEG_INFINITY,
             };
             text_layout.Draw(
                 Some((&raw mut renderer_context).cast::<c_void>().cast_const()),
@@ -651,7 +673,24 @@ impl DirectWriteState {
                 0.0,
                 0.0,
             )?;
-            let width = px(renderer_context.width);
+
+            // Right-to-left paragraphs are laid out against the right edge of the
+            // layout box, so the runs do not start at the left edge. Move them
+            // back so that the line starts at zero and can be aligned by the
+            // caller.
+            let (left, right) = if runs.is_empty() {
+                (0.0, 0.0)
+            } else {
+                (renderer_context.left, renderer_context.right)
+            };
+            if left != 0.0 {
+                for run in &mut runs {
+                    for glyph in &mut run.glyphs {
+                        glyph.position.x -= px(left);
+                    }
+                }
+            }
+            let width = px(right - left);
 
             Ok(LineLayout {
                 font_size,
@@ -1429,7 +1468,10 @@ struct RendererContext<'t, 'a, 'b> {
     components: &'a DirectWriteComponents,
     index_converter: StringIndexConverter,
     runs: &'b mut Vec<ShapedRun>,
-    width: f32,
+    /// Left edge of the shaped text, in layout coordinates.
+    left: f32,
+    /// Right edge of the shaped text, in layout coordinates.
+    right: f32,
 }
 
 #[allow(non_snake_case)]
@@ -1562,10 +1604,15 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         let run_advance = glyph_advances.iter().sum::<f32>();
         // For an RTL run the origin sits at the run's right edge and glyphs
         // advance leftward; for an LTR run the origin is the left edge.
-        let mut run_right = if is_rtl {
+        let run_right = if is_rtl {
             baselineoriginx
         } else {
             baselineoriginx + run_advance
+        };
+        let run_left = if is_rtl {
+            baselineoriginx - run_advance
+        } else {
+            baselineoriginx
         };
         let mut advance = 0.0;
         let mut glyphs = Vec::with_capacity(glyph_count);
@@ -1595,7 +1642,8 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                 .partial_cmp(&b.position.x)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        context.width = context.width.max(run_right);
+        context.left = context.left.min(run_left);
+        context.right = context.right.max(run_right);
         context.runs.push(ShapedRun { font_id, glyphs });
         Ok(())
     }
