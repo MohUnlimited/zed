@@ -34,6 +34,52 @@ use gpui::*;
 /// they have been collected.
 const RTL_LAYOUT_WIDTH: f32 = 1024.0;
 
+/// Horizontal bounds of a glyph run reported by DirectWrite.
+///
+/// DirectWrite reports the origin of a right-to-left run at the run's right
+/// edge, while the origin of a left-to-right run is its left edge. Returns the
+/// left and the right edge of the run, in layout coordinates.
+fn run_bounds(origin_x: f32, run_advance: f32, is_rtl: bool) -> (f32, f32) {
+    if is_rtl {
+        (origin_x - run_advance, origin_x)
+    } else {
+        (origin_x, origin_x + run_advance)
+    }
+}
+
+/// Left edge of a glyph within a run, in layout coordinates.
+///
+/// The glyphs of a right-to-left run are placed from right to left, starting at
+/// the run's right edge, so the first glyph of the run is the rightmost one.
+fn glyph_left(
+    origin_x: f32,
+    advance_before: f32,
+    glyph_advance: f32,
+    advance_offset: f32,
+    is_rtl: bool,
+) -> f32 {
+    if is_rtl {
+        origin_x - advance_before - glyph_advance - advance_offset
+    } else {
+        origin_x + advance_before + advance_offset
+    }
+}
+
+/// Moves the shaped runs so that the text starts at the left edge.
+///
+/// Right-to-left paragraphs are laid out against the right edge of the layout
+/// box, so their runs do not start at x = 0. Returns the width of the text.
+fn normalize_run_positions(runs: &mut [ShapedRun], left: f32, right: f32) -> Pixels {
+    if left != 0.0 {
+        for run in runs.iter_mut() {
+            for glyph in run.glyphs.iter_mut() {
+                glyph.position.x -= px(left);
+            }
+        }
+    }
+    px(right - left)
+}
+
 #[derive(Debug)]
 struct FontInfo {
     font_family_h: HSTRING,
@@ -678,19 +724,13 @@ impl DirectWriteState {
             // layout box, so the runs do not start at the left edge. Move them
             // back so that the line starts at zero and can be aligned by the
             // caller.
-            let (left, right) = if runs.is_empty() {
+            let (left, right) = if renderer_context.runs.is_empty() {
                 (0.0, 0.0)
             } else {
                 (renderer_context.left, renderer_context.right)
             };
-            if left != 0.0 {
-                for run in &mut runs {
-                    for glyph in &mut run.glyphs {
-                        glyph.position.x -= px(left);
-                    }
-                }
-            }
-            let width = px(right - left);
+            drop(renderer_context);
+            let width = normalize_run_positions(&mut runs, left, right);
 
             Ok(LineLayout {
                 font_size,
@@ -1604,16 +1644,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         let run_advance = glyph_advances.iter().sum::<f32>();
         // For an RTL run the origin sits at the run's right edge and glyphs
         // advance leftward; for an LTR run the origin is the left edge.
-        let run_right = if is_rtl {
-            baselineoriginx
-        } else {
-            baselineoriginx + run_advance
-        };
-        let run_left = if is_rtl {
-            baselineoriginx - run_advance
-        } else {
-            baselineoriginx
-        };
+        let (run_left, mut run_right) = run_bounds(baselineoriginx, run_advance, is_rtl);
         let mut advance = 0.0;
         let mut glyphs = Vec::with_capacity(glyph_count);
         for (glyph_idx, glyph_id) in glyph_ids.iter().enumerate() {
@@ -1621,11 +1652,13 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             let is_emoji = color_font && is_color_glyph(font_face, id, &context.components.factory);
             let glyph_advance = glyph_advances[glyph_idx];
             let offset = glyph_offsets[glyph_idx];
-            let x = if is_rtl {
-                baselineoriginx - advance - glyph_advance - offset.advanceOffset
-            } else {
-                baselineoriginx + advance + offset.advanceOffset
-            };
+            let x = glyph_left(
+                baselineoriginx,
+                advance,
+                glyph_advance,
+                offset.advanceOffset,
+                is_rtl,
+            );
             run_right = run_right.max(x + glyph_advance);
             let utf16_idx = desc.textPosition as usize + glyph_utf16_starts[glyph_idx];
             glyphs.push(ShapedGlyph {
@@ -2014,8 +2047,10 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectWriteState, DirectWriteTextSystem, GPUState, GlyphLayerTexture};
-    use crate::direct_write::{StringIndexConverter, glyph_utf16_start_indices};
+    use super::{
+        DirectWriteState, DirectWriteTextSystem, GPUState, GlyphLayerTexture, StringIndexConverter,
+        glyph_utf16_start_indices,
+    };
     use crate::directx_devices::DirectXDevices;
     use anyhow::Result;
     use gpui::{
@@ -2219,5 +2254,78 @@ mod tests {
             "uncovered texel retained the poison from the uninitialized render target"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rtl_geometry_tests {
+    use super::{glyph_left, normalize_run_positions, run_bounds};
+    use gpui::{FontId, GlyphId, ShapedGlyph, ShapedRun, point, px};
+
+    #[test]
+    fn test_ltr_run_bounds_start_at_the_origin() {
+        assert_eq!(run_bounds(10.0, 25.0, false), (10.0, 35.0));
+    }
+
+    #[test]
+    fn test_rtl_run_bounds_end_at_the_origin() {
+        // DirectWrite reports the origin of a right-to-left run at its right
+        // edge, so the run extends to the left of the origin.
+        assert_eq!(run_bounds(35.0, 25.0, true), (10.0, 35.0));
+    }
+
+    #[test]
+    fn test_ltr_glyphs_advance_to_the_right() {
+        assert_eq!(glyph_left(10.0, 0.0, 8.0, 0.0, false), 10.0);
+        assert_eq!(glyph_left(10.0, 8.0, 6.0, 0.0, false), 18.0);
+    }
+
+    #[test]
+    fn test_rtl_glyphs_advance_to_the_left() {
+        // The first glyph of a right-to-left run is the rightmost one.
+        assert_eq!(glyph_left(35.0, 0.0, 8.0, 0.0, true), 27.0);
+        assert_eq!(glyph_left(35.0, 8.0, 6.0, 0.0, true), 21.0);
+    }
+
+    #[test]
+    fn test_normalize_run_positions_moves_rtl_paragraph_to_the_left_edge() {
+        let glyph = |x: f32, index: usize| ShapedGlyph {
+            id: GlyphId(index as u32),
+            position: point(px(x), px(0.0)),
+            index,
+            is_emoji: false,
+        };
+        let mut runs = vec![ShapedRun {
+            font_id: FontId(0),
+            glyphs: vec![glyph(27.0, 0), glyph(21.0, 1)],
+        }];
+
+        // A right-to-left paragraph is laid out against the right edge of the
+        // layout box, so its runs start at a non-zero offset.
+        let width = normalize_run_positions(&mut runs, 10.0, 35.0);
+
+        assert_eq!(width, px(25.0));
+        assert_eq!(runs[0].glyphs[0].position.x, px(17.0));
+        assert_eq!(runs[0].glyphs[1].position.x, px(11.0));
+    }
+
+    #[test]
+    fn test_normalize_run_positions_keeps_ltr_paragraph_untouched() {
+        let glyph = |x: f32, index: usize| ShapedGlyph {
+            id: GlyphId(index as u32),
+            position: point(px(x), px(0.0)),
+            index,
+            is_emoji: false,
+        };
+        let mut runs = vec![ShapedRun {
+            font_id: FontId(0),
+            glyphs: vec![glyph(0.0, 0), glyph(8.0, 1)],
+        }];
+
+        let width = normalize_run_positions(&mut runs, 0.0, 16.0);
+
+        assert_eq!(width, px(16.0));
+        assert_eq!(runs[0].glyphs[0].position.x, px(0.0));
+        assert_eq!(runs[0].glyphs[1].position.x, px(8.0));
     }
 }
