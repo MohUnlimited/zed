@@ -1146,6 +1146,7 @@ impl EditorElement {
         visible_display_row_range: Range<DisplayRow>,
         line_layouts: &[LineWithInvisibles],
         text_hitbox: &Hitbox,
+        content_width: Pixels,
         content_origin: gpui::Point<Pixels>,
         scroll_position: gpui::Point<ScrollOffset>,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
@@ -1214,10 +1215,10 @@ impl EditorElement {
 
                     let cursor_character_x = cursor_row_layout.x_for_index(cursor_column)
                         + cursor_row_layout
-                            .alignment_offset(self.style.text.text_align, text_hitbox.size.width);
+                            .alignment_offset(self.style.text.text_align, content_width);
                     let cursor_next_x = cursor_row_layout.x_for_index(cursor_column + 1)
                         + cursor_row_layout
-                            .alignment_offset(self.style.text.text_align, text_hitbox.size.width);
+                            .alignment_offset(self.style.text.text_align, content_width);
                     // In RTL runs the next logical boundary can lie to the left of the
                     // caret, so the highlighted cell spans both directions.
                     let mut cell_width = (cursor_next_x - cursor_character_x).abs();
@@ -1403,7 +1404,7 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         visible_display_row_range: Range<DisplayRow>,
         line_layouts: &[LineWithInvisibles],
-        text_hitbox: &Hitbox,
+        content_width: Pixels,
         content_origin: gpui::Point<Pixels>,
         scroll_position: gpui::Point<ScrollOffset>,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
@@ -1428,7 +1429,7 @@ impl EditorElement {
             visible_display_row_range: &visible_display_row_range,
             line_layouts,
             text_align: self.style.text.text_align,
-            content_width: text_hitbox.size.width,
+            content_width,
             content_origin,
             scroll_position,
             scroll_pixel_position,
@@ -9865,7 +9866,7 @@ impl Element for EditorElement {
                         scroll_position,
                         scroll_pixel_position,
                         content_origin,
-                        text_hitbox.size.width,
+                        editor_width,
                         window,
                         cx,
                     );
@@ -9908,6 +9909,7 @@ impl Element for EditorElement {
                         start_row..end_row,
                         &line_layouts,
                         &text_hitbox,
+                        editor_width,
                         content_origin,
                         scroll_position,
                         scroll_pixel_position,
@@ -9923,7 +9925,7 @@ impl Element for EditorElement {
                         &snapshot,
                         start_row..end_row,
                         &line_layouts,
-                        &text_hitbox,
+                        editor_width,
                         content_origin,
                         scroll_position,
                         scroll_pixel_position,
@@ -10306,7 +10308,7 @@ impl Element for EditorElement {
                         em_layout_width,
                         snapshot,
                         text_align: self.style.text.text_align,
-                        content_width: text_hitbox.size.width,
+                        content_width: editor_width,
                         content_origin,
                         gutter_hitbox: gutter_hitbox.clone(),
                         text_hitbox: text_hitbox.clone(),
@@ -10374,7 +10376,7 @@ impl Element for EditorElement {
                         sticky_headers,
                         expand_toggles,
                         text_align: self.style.text.text_align,
-                        content_width: text_hitbox.size.width,
+                        content_width: editor_width,
                     }
                 })
             })
