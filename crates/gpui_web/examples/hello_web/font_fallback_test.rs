@@ -35,7 +35,7 @@ pub fn test_missing_glyph_notifications() -> Result<(), JsValue> {
         len: text.len(),
         font_id,
     }];
-    let layout = text_system.layout_line(text, px(24.), &runs);
+    let layout = text_system.layout_line(text, px(24.), &runs, gpui::TextDirection::LeftToRight);
     assert!(
         layout
             .runs
@@ -69,6 +69,7 @@ pub fn test_missing_glyph_notifications() -> Result<(), JsValue> {
                 len: text.len(),
                 font_id,
             }],
+            gpui::TextDirection::LeftToRight,
         );
         let glyphs = layout
             .runs
@@ -102,6 +103,7 @@ pub fn test_missing_glyph_notifications() -> Result<(), JsValue> {
             len: bundled.len(),
             font_id,
         }],
+        gpui::TextDirection::LeftToRight,
     );
     for run in &layout.runs {
         assert_eq!(run.font_id, font_id, "Retain existing bundled text glyphs");
@@ -111,7 +113,7 @@ pub fn test_missing_glyph_notifications() -> Result<(), JsValue> {
 
     reports.0.lock().expect("report lock").clear();
     text_system.set_missing_glyph_sink(None);
-    text_system.layout_line(text, px(24.), &runs);
+    text_system.layout_line(text, px(24.), &runs, gpui::TextDirection::LeftToRight);
     assert!(reports.0.lock().expect("report lock").is_empty());
     Ok(())
 }

@@ -397,7 +397,13 @@ impl PlatformTextSystem for WebTextSystem {
         Ok((bounds.size, pixels))
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        direction: gpui::TextDirection,
+    ) -> LineLayout {
         let native_runs: Cow<'_, [FontRun]> =
             if runs.iter().any(|run| run.font_id.0 & CANVAS_FONT_BIT != 0) {
                 Cow::Owned(
@@ -411,7 +417,9 @@ impl PlatformTextSystem for WebTextSystem {
             } else {
                 Cow::Borrowed(runs)
             };
-        let mut layout = self.native.layout_line(text, font_size, &native_runs);
+        let mut layout = self
+            .native
+            .layout_line(text, font_size, &native_runs, direction);
         self.apply_fallback(text, &native_runs, &mut layout);
         let sink = self.state.read().missing_glyph_sink.clone();
         if let Some(sink) = sink {

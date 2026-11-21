@@ -24,6 +24,60 @@ use windows_numerics::Vector2;
 use crate::*;
 use gpui::*;
 
+/// Width of the layout box used for right-to-left paragraphs.
+///
+/// DirectWrite aligns right-to-left paragraphs against the right edge of the
+/// layout box, so the box has to have a finite width. The value only exists to
+/// keep the run origins finite; the runs are moved back to the left edge after
+/// they have been collected.
+const RTL_LAYOUT_WIDTH: f32 = 1024.0;
+
+/// Horizontal bounds of a glyph run reported by DirectWrite.
+///
+/// DirectWrite reports the origin of a right-to-left run at the run's right
+/// edge, while the origin of a left-to-right run is its left edge. Returns the
+/// left and the right edge of the run, in layout coordinates.
+fn run_bounds(origin_x: f32, run_advance: f32, is_rtl: bool) -> (f32, f32) {
+    if is_rtl {
+        (origin_x - run_advance, origin_x)
+    } else {
+        (origin_x, origin_x + run_advance)
+    }
+}
+
+/// Left edge of a glyph within a run, in layout coordinates.
+///
+/// The glyphs of a right-to-left run are placed from right to left, starting at
+/// the run's right edge, so the first glyph of the run is the rightmost one.
+fn glyph_left(
+    origin_x: f32,
+    advance_before: f32,
+    glyph_advance: f32,
+    advance_offset: f32,
+    is_rtl: bool,
+) -> f32 {
+    if is_rtl {
+        origin_x - advance_before - glyph_advance - advance_offset
+    } else {
+        origin_x + advance_before + advance_offset
+    }
+}
+
+/// Moves the shaped runs so that the text starts at the left edge.
+///
+/// Right-to-left paragraphs are laid out against the right edge of the layout
+/// box, so their runs do not start at x = 0. Returns the width of the text.
+fn normalize_run_positions(runs: &mut [ShapedRun], left: f32, right: f32) -> Pixels {
+    if left != 0.0 {
+        for run in runs.iter_mut() {
+            for glyph in run.glyphs.iter_mut() {
+                glyph.position.x -= px(left);
+            }
+        }
+    }
+    px(right - left)
+}
+
 #[derive(Debug)]
 struct FontInfo {
     font_family_h: HSTRING,
@@ -174,10 +228,16 @@ impl PlatformTextSystem for DirectWriteTextSystem {
             .rasterize_glyph(&self.components, params, raster_bounds)
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        direction: TextDirection,
+    ) -> LineLayout {
         self.state
             .write()
-            .layout_line(&self.components, text, font_size, runs)
+            .layout_line(&self.components, text, font_size, runs, direction)
             .log_err()
             .unwrap_or(LineLayout {
                 font_size,
@@ -415,9 +475,16 @@ impl DirectWriteState {
         text: &str,
         font_size: Pixels,
         font_runs: &[FontRun],
+        direction: TextDirection,
     ) -> Result<LineLayout> {
         if !text.contains(is_line_separator) {
-            return self.layout_line_without_separators(components, text, font_size, font_runs);
+            return self.layout_line_without_separators(
+                components,
+                text,
+                font_size,
+                font_runs,
+                direction,
+            );
         }
 
         // DirectWrite honors mandatory breaks even without wrapping. Keep each
@@ -453,8 +520,13 @@ impl DirectWriteState {
                 }
             }
 
-            let segment_layout =
-                self.layout_line_without_separators(components, segment, font_size, &segment_runs)?;
+            let segment_layout = self.layout_line_without_separators(
+                components,
+                segment,
+                font_size,
+                &segment_runs,
+                direction,
+            )?;
             for mut run in segment_layout.runs {
                 for glyph in &mut run.glyphs {
                     glyph.index += text_offset;
@@ -482,6 +554,7 @@ impl DirectWriteState {
         text: &str,
         font_size: Pixels,
         font_runs: &[FontRun],
+        direction: TextDirection,
     ) -> Result<LineLayout> {
         if font_runs.is_empty() {
             return Ok(LineLayout {
@@ -514,12 +587,38 @@ impl DirectWriteState {
                     .cast()?;
                 if let Some(ref fallbacks) = font_info.fallbacks {
                     format.SetFontFallback(fallbacks)?;
+                } else {
+                    // Ensure the system font fallback is explicitly set so missing
+                    // glyphs (e.g. Arabic or Persian) resolve on all Windows setups.
+                    let system_fallbacks = components.factory.GetSystemFontFallback()?;
+                    format.SetFontFallback(&system_fallbacks)?;
                 }
+
+                // DirectWrite performs the UAX #9 bidirectional analysis inside
+                // `IDWriteTextLayout` using the format's reading direction as the
+                // paragraph embedding level, so an RTL base direction must be
+                // set here for right-to-left paragraphs.
+                //
+                // A right-to-left paragraph is aligned against the right edge of
+                // the layout box, so the box needs a finite width: with an
+                // infinite width DirectWrite derives the run origins from
+                // `infinity - line width`, which places every glyph at an
+                // infinite offset and renders the line invisible. The runs are
+                // moved back to the left edge once they have been collected.
+                // Word wrapping is disabled because line breaking is handled by
+                // gpui, not by DirectWrite.
+                let max_width = if direction.is_rtl() {
+                    format.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT)?;
+                    format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                    RTL_LAYOUT_WIDTH
+                } else {
+                    f32::INFINITY
+                };
 
                 let layout = components.factory.CreateTextLayout(
                     text_wide,
                     &format,
-                    f32::INFINITY,
+                    max_width,
                     f32::INFINITY,
                 )?;
                 let current_text = &text[utf8_offset..(utf8_offset + first_run.len)];
@@ -579,7 +678,8 @@ impl DirectWriteState {
                 index_converter: StringIndexConverter::new(text),
                 runs: &mut runs,
                 layout: &text_layout,
-                width: 0.0,
+                left: f32::INFINITY,
+                right: f32::NEG_INFINITY,
             };
             text_layout.Draw(
                 Some((&raw mut renderer_context).cast::<c_void>().cast_const()),
@@ -587,7 +687,18 @@ impl DirectWriteState {
                 0.0,
                 0.0,
             )?;
-            let width = px(renderer_context.width);
+
+            // Right-to-left paragraphs are laid out against the right edge of the
+            // layout box, so the runs do not start at the left edge. Move them
+            // back so that the line starts at zero and can be aligned by the
+            // caller.
+            let (left, right) = if renderer_context.runs.is_empty() {
+                (0.0, 0.0)
+            } else {
+                (renderer_context.left, renderer_context.right)
+            };
+            drop(renderer_context);
+            let width = normalize_run_positions(&mut runs, left, right);
 
             Ok(LineLayout {
                 font_size,
@@ -596,6 +707,9 @@ impl DirectWriteState {
                 descent,
                 runs,
                 len: text.len(),
+                index_positions: Vec::new(),
+                visual_index_positions: Vec::new(),
+                direction,
             })
         }
     }
@@ -1188,66 +1302,13 @@ impl TextRenderer {
 struct RendererContext<'t, 'a, 'b> {
     text_system: &'t mut DirectWriteState,
     components: &'a DirectWriteComponents,
-    index_converter: StringIndexConverter<'a>,
+    index_converter: StringIndexConverter,
     runs: &'b mut Vec<ShapedRun>,
     layout: &'b IDWriteTextLayout,
-    width: f32,
-}
-
-#[derive(Debug)]
-struct ClusterAnalyzer<'t> {
-    utf16_idx: usize,
-    glyph_idx: usize,
-    glyph_count: usize,
-    cluster_map: &'t [u16],
-}
-
-impl<'t> ClusterAnalyzer<'t> {
-    fn new(cluster_map: &'t [u16], glyph_count: usize) -> Self {
-        ClusterAnalyzer {
-            utf16_idx: 0,
-            glyph_idx: 0,
-            glyph_count,
-            cluster_map,
-        }
-    }
-}
-
-impl Iterator for ClusterAnalyzer<'_> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<(usize, usize)> {
-        if self.utf16_idx >= self.cluster_map.len() {
-            return None; // No more clusters
-        }
-        let start_utf16_idx = self.utf16_idx;
-        let current_glyph = self.cluster_map[start_utf16_idx] as usize;
-
-        // Find the end of current cluster (where glyph index changes)
-        let mut end_utf16_idx = start_utf16_idx + 1;
-        while end_utf16_idx < self.cluster_map.len()
-            && self.cluster_map[end_utf16_idx] as usize == current_glyph
-        {
-            end_utf16_idx += 1;
-        }
-
-        let utf16_len = end_utf16_idx - start_utf16_idx;
-
-        // Calculate glyph count for this cluster
-        let next_glyph = if end_utf16_idx < self.cluster_map.len() {
-            self.cluster_map[end_utf16_idx] as usize
-        } else {
-            self.glyph_count
-        };
-
-        let glyph_count = next_glyph - current_glyph;
-
-        // Update state for next call
-        self.utf16_idx = end_utf16_idx;
-        self.glyph_idx = next_glyph;
-
-        Some((utf16_len, glyph_count))
-    }
+    /// Left edge of the shaped text, in layout coordinates.
+    left: f32,
+    /// Right edge of the shaped text, in layout coordinates.
+    right: f32,
 }
 
 #[allow(non_snake_case)]
@@ -1290,7 +1351,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
     fn DrawGlyphRun(
         &self,
         clientdrawingcontext: *const ::core::ffi::c_void,
-        _baselineoriginx: f32,
+        baselineoriginx: f32,
         _baselineoriginy: f32,
         _measuringmode: DWRITE_MEASURING_MODE,
         glyphrun: *const DWRITE_GLYPH_RUN,
@@ -1352,105 +1413,233 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             )?;
 
         if let Some(text) = text {
+
             // Tabs have layout advances but no glyph advances. Keep invisible
+
             // glyphs so LineLayout can map their byte indices to caret positions.
+
+            let is_rtl = glyphrun.bidiLevel % 2 == 1;
+
             let mut glyphs = Vec::new();
+
+            let mut advance = 0.0;
+
             for (offset, &character) in text.iter().enumerate() {
+
                 if character != u16::from(b'\t') {
+
                     continue;
+
                 }
+
                 let position = desc.textPosition + offset as u32;
+
                 let mut x = 0.0;
+
                 let mut y = 0.0;
+
                 let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+
                 let mut space = 0;
+
                 unsafe {
+
                     context.layout.HitTestTextPosition(
+
                         position,
+
                         false,
+
                         &mut x,
+
                         &mut y,
+
                         &mut metrics,
+
                     )?;
+
                     font_face.GetGlyphIndices(&u32::from(b' '), 1, &mut space)?;
+
                 }
-                context
-                    .index_converter
-                    .advance_to_utf16_ix(position as usize);
+
+                // The tab advances to the next tab stop, and the invisible glyph
+
+                // sits at the position the tab starts from.
+
+                let glyph_x = glyph_left(baselineoriginx, advance, metrics.width, 0.0, is_rtl);
+
+                advance += metrics.width;
+
                 glyphs.push(ShapedGlyph {
+
                     id: GlyphId(u32::from(space)),
-                    position: point(px(context.width), px(0.0)),
-                    index: context.index_converter.utf8_ix,
+
+                    position: point(px(glyph_x), px(0.0)),
+
+                    index: context.index_converter.utf8_ix_for_utf16_ix(position as usize),
+
                     is_emoji: false,
+
                 });
-                context.width += metrics.width;
+
             }
+
             if !glyphs.is_empty() {
+
+                let (run_left, run_right) = run_bounds(baselineoriginx, advance, is_rtl);
+
+                context.left = context.left.min(run_left);
+
+                context.right = context.right.max(run_right);
+
                 context.runs.push(ShapedRun { font_id, glyphs });
+
             }
+
         } else {
+
             let color_font = unsafe { font_face.IsColorFont().as_bool() };
 
+
+
             let glyph_ids = unsafe {
+
                 slice_from_nullable(
+
                     glyphrun.glyphIndices,
+
                     glyph_count,
+
                     "DirectWrite returned a null glyph indices array",
+
                 )?
-            };
-            let glyph_advances = unsafe {
-                slice_from_nullable(
-                    glyphrun.glyphAdvances,
-                    glyph_count,
-                    "DirectWrite returned a null glyph advances array",
-                )?
-            };
-            let glyph_offsets = unsafe {
-                slice_from_nullable(
-                    glyphrun.glyphOffsets,
-                    glyph_count,
-                    "DirectWrite returned a null glyph offsets array",
-                )?
-            };
-            let cluster_map = unsafe {
-                slice_from_nullable(
-                    desc.clusterMap,
-                    desc.stringLength as usize,
-                    "DirectWrite returned a null cluster map",
-                )?
+
             };
 
-            let cluster_analyzer = ClusterAnalyzer::new(cluster_map, glyph_count);
-            let mut utf16_idx = desc.textPosition as usize;
-            let mut glyph_idx = 0;
+            let glyph_advances = unsafe {
+
+                slice_from_nullable(
+
+                    glyphrun.glyphAdvances,
+
+                    glyph_count,
+
+                    "DirectWrite returned a null glyph advances array",
+
+                )?
+
+            };
+
+            let glyph_offsets = unsafe {
+
+                slice_from_nullable(
+
+                    glyphrun.glyphOffsets,
+
+                    glyph_count,
+
+                    "DirectWrite returned a null glyph offsets array",
+
+                )?
+
+            };
+
+            let cluster_map = unsafe {
+
+                slice_from_nullable(
+
+                    desc.clusterMap,
+
+                    desc.stringLength as usize,
+
+                    "DirectWrite returned a null cluster map",
+
+                )?
+
+            };
+
+
+
+            let glyph_utf16_starts = glyph_utf16_start_indices(cluster_map, glyph_count);
+
+            let is_rtl = glyphrun.bidiLevel % 2 == 1;
+
+            let run_advance = glyph_advances.iter().sum::<f32>();
+
+            // For an RTL run the origin sits at the run's right edge and glyphs
+
+            // advance leftward; for an LTR run the origin is the left edge.
+
+            let (run_left, mut run_right) = run_bounds(baselineoriginx, run_advance, is_rtl);
+
+            let mut advance = 0.0;
+
             let mut glyphs = Vec::with_capacity(glyph_count);
-            for (cluster_utf16_len, cluster_glyph_count) in cluster_analyzer {
-                context.index_converter.advance_to_utf16_ix(utf16_idx);
-                utf16_idx += cluster_utf16_len;
-                for (cluster_glyph_idx, glyph_id) in glyph_ids
-                    [glyph_idx..(glyph_idx + cluster_glyph_count)]
-                    .iter()
-                    .enumerate()
-                {
-                    let id = GlyphId(*glyph_id as u32);
-                    let is_emoji =
-                        color_font && is_color_glyph(font_face, id, &context.components.factory);
-                    let this_glyph_idx = glyph_idx + cluster_glyph_idx;
-                    glyphs.push(ShapedGlyph {
-                        id,
-                        position: point(
-                            px(context.width + glyph_offsets[this_glyph_idx].advanceOffset),
-                            px(-glyph_offsets[this_glyph_idx].ascenderOffset),
-                        ),
-                        index: context.index_converter.utf8_ix,
-                        is_emoji,
-                    });
-                    context.width += glyph_advances[this_glyph_idx];
-                }
-                glyph_idx += cluster_glyph_count;
+
+            for (glyph_idx, glyph_id) in glyph_ids.iter().enumerate() {
+
+                let id = GlyphId(*glyph_id as u32);
+
+                let is_emoji = color_font && is_color_glyph(font_face, id, &context.components.factory);
+
+                let glyph_advance = glyph_advances[glyph_idx];
+
+                let offset = glyph_offsets[glyph_idx];
+
+                let x = glyph_left(
+
+                    baselineoriginx,
+
+                    advance,
+
+                    glyph_advance,
+
+                    offset.advanceOffset,
+
+                    is_rtl,
+
+                );
+
+                run_right = run_right.max(x + glyph_advance);
+
+                let utf16_idx = desc.textPosition as usize + glyph_utf16_starts[glyph_idx];
+
+                glyphs.push(ShapedGlyph {
+
+                    id,
+
+                    position: point(px(x), px(-offset.ascenderOffset)),
+
+                    index: context.index_converter.utf8_ix_for_utf16_ix(utf16_idx),
+
+                    is_emoji,
+
+                });
+
+                advance += glyph_advance;
+
             }
+
+            glyphs.sort_by(|a, b| {
+
+                a.position
+
+                    .x
+
+                    .partial_cmp(&b.position.x)
+
+                    .unwrap_or(std::cmp::Ordering::Equal)
+
+            });
+
+            context.left = context.left.min(run_left);
+
+            context.right = context.right.max(run_right);
+
             context.runs.push(ShapedRun { font_id, glyphs });
+
         }
+
         Ok(())
     }
 
@@ -1522,43 +1711,70 @@ unsafe fn slice_from_nullable<'a, T>(
     }
 }
 
-struct StringIndexConverter<'a> {
-    text: &'a str,
-    utf8_ix: usize,
-    utf16_ix: usize,
+struct StringIndexConverter {
+    utf16_to_utf8: Vec<usize>,
 }
 
-impl<'a> StringIndexConverter<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            text,
-            utf8_ix: 0,
-            utf16_ix: 0,
+impl StringIndexConverter {
+    fn new(text: &str) -> Self {
+        let mut utf16_to_utf8 = vec![text.len(); text.encode_utf16().count() + 1];
+        let mut utf16_ix = 0;
+        for (utf8_ix, c) in text.char_indices() {
+            let next_utf16_ix = utf16_ix + c.len_utf16();
+            let next_utf8_ix = utf8_ix + c.len_utf8();
+            utf16_to_utf8[utf16_ix] = utf8_ix;
+            for target_utf16_ix in utf16_ix + 1..=next_utf16_ix {
+                utf16_to_utf8[target_utf16_ix] = next_utf8_ix;
+            }
+            utf16_ix = next_utf16_ix;
+        }
+
+        if let Some(last) = utf16_to_utf8.last_mut() {
+            *last = text.len();
+        }
+
+        Self { utf16_to_utf8 }
+    }
+
+    fn utf8_ix_for_utf16_ix(&self, utf16_target: usize) -> usize {
+        self.utf16_to_utf8
+            .get(utf16_target)
+            .copied()
+            .unwrap_or_else(|| self.utf16_to_utf8.last().copied().unwrap_or_default())
+    }
+}
+
+fn glyph_utf16_start_indices(cluster_map: &[u16], glyph_count: usize) -> Vec<usize> {
+    if cluster_map.is_empty() {
+        return (0..glyph_count).collect();
+    }
+
+    let mut glyph_utf16_starts = vec![usize::MAX; glyph_count];
+    let mut saw_cluster = false;
+    for (utf16_idx, glyph_start) in cluster_map.iter().copied().enumerate() {
+        let glyph_start = glyph_start as usize;
+        if glyph_start >= glyph_count {
+            continue;
+        }
+
+        saw_cluster = true;
+        glyph_utf16_starts[glyph_start] = glyph_utf16_starts[glyph_start].min(utf16_idx);
+    }
+
+    if !saw_cluster {
+        return vec![0; glyph_count];
+    }
+
+    let mut last_utf16_idx = 0;
+    for utf16_idx in &mut glyph_utf16_starts {
+        if *utf16_idx == usize::MAX {
+            *utf16_idx = last_utf16_idx;
+        } else {
+            last_utf16_idx = *utf16_idx;
         }
     }
 
-    #[allow(dead_code)]
-    fn advance_to_utf8_ix(&mut self, utf8_target: usize) {
-        for (ix, c) in self.text[self.utf8_ix..].char_indices() {
-            if self.utf8_ix + ix >= utf8_target {
-                self.utf8_ix += ix;
-                return;
-            }
-            self.utf16_ix += c.len_utf16();
-        }
-        self.utf8_ix = self.text.len();
-    }
-
-    fn advance_to_utf16_ix(&mut self, utf16_target: usize) {
-        for (ix, c) in self.text[self.utf8_ix..].char_indices() {
-            if self.utf16_ix >= utf16_target {
-                self.utf8_ix += ix;
-                return;
-            }
-            self.utf16_ix += c.len_utf16();
-        }
-        self.utf8_ix = self.text.len();
-    }
+    glyph_utf16_starts
 }
 
 fn font_style_to_dwrite(style: FontStyle) -> DWRITE_FONT_STYLE {
@@ -1797,12 +2013,28 @@ fn is_line_separator(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::DirectWriteTextSystem;
-    use crate::direct_write::ClusterAnalyzer;
+    use super::{DirectWriteTextSystem, StringIndexConverter, glyph_utf16_start_indices};
     use anyhow::Result;
     use gpui::{Font, FontWeight, PlatformTextSystem, TextRun, TextSystem, WindowTextSystem, px};
     use std::sync::Arc;
-    use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_STRETCH_NORMAL, DWRITE_TEXT_METRICS};
+    use windows::Win32::Graphics::DirectWrite::{
+        DWRITE_FONT_STRETCH_NORMAL, DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_METRICS,
+    };
+
+    /// Whether the character belongs to a right-to-left script.
+    fn is_rtl_character(character: char) -> bool {
+        matches!(
+            character as u32,
+            0x0590..=0x05FF // Hebrew
+                | 0x0600..=0x06FF // Arabic
+                | 0x0700..=0x074F // Syriac
+                | 0x0750..=0x077F // Arabic supplement
+                | 0x0780..=0x07BF // Thaana
+                | 0x07C0..=0x08FF // NKo, Samaritan, Arabic extended
+                | 0xFB1D..=0xFDFF // Hebrew/Arabic presentation forms
+                | 0xFE70..=0xFEFF // Arabic presentation forms
+        )
+    }
 
     #[test]
     fn tabs_preserve_native_advances_and_cursor() -> Result<()> {
@@ -1849,7 +2081,7 @@ mod tests {
                     "a\tאב\tb",
                 ] {
                     let mut native_metrics = DWRITE_TEXT_METRICS::default();
-                    unsafe {
+                    let native_layout = unsafe {
                         let layout = platform_text_system.components.factory.CreateTextLayout(
                             &text.encode_utf16().collect::<Vec<_>>(),
                             &format,
@@ -1857,8 +2089,38 @@ mod tests {
                             f32::INFINITY,
                         )?;
                         layout.GetMetrics(&mut native_metrics)?;
-                    }
+                        layout
+                    };
+                    // The native caret positions of the text, together with the
+                    // horizontal extent of the character at each position. Text
+                    // containing right-to-left characters is laid out visually,
+                    // so these positions are not in logical order.
+                    let native_caret_positions = {
+                        let mut positions = Vec::new();
+                        for utf16_ix in 0..=text.encode_utf16().count() {
+                            let mut x = 0.0;
+                            let mut y = 0.0;
+                            let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+                            unsafe {
+                                native_layout.HitTestTextPosition(
+                                    utf16_ix as u32,
+                                    false,
+                                    &mut x,
+                                    &mut y,
+                                    &mut metrics,
+                                )?;
+                            }
+                            positions.push((x, metrics.left, metrics.width));
+                        }
+                        positions
+                    };
                     for split_runs in [false, true] {
+                        // Bidirectional text is shaped visually, so the cursor splits
+                        // the line into visual segments instead of advancing a pen
+                        // through the logical characters. The width of an individual
+                        // piece is therefore not the logical advance of the
+                        // characters it contains.
+                        let is_bidirectional = text.chars().any(is_rtl_character);
                         let runs = if split_runs {
                             text.chars()
                                 .map(|character| TextRun {
@@ -1877,6 +2139,7 @@ mod tests {
                         let shaped = text_system.shape_line(text.into(), font_size, &runs, None);
                         let mut cursor = shaped.cursor();
                         let mut expected_x = px(0.0);
+                        let mut utf16_ix = 0;
                         for (index, character) in text.char_indices() {
                             let end = index + character.len_utf8();
                             let expected_end = if character == '\t' {
@@ -1897,23 +2160,43 @@ mod tests {
                                         )
                                         .width
                             };
+                            // Caret positions follow the visual order of the shaped
+                            // line, so they are compared against the positions the
+                            // native layout reports.
+                            let (native_caret_x, native_left, native_width) =
+                                native_caret_positions[utf16_ix];
+                            let expected_caret_x = px(native_caret_x);
+                            utf16_ix += character.len_utf16();
                             assert!(
-                                (shaped.x_for_index(index) - expected_x).abs() < px(0.001),
+                                (shaped.x_for_index(index) - expected_caret_x).abs() < px(0.001),
                                 "{family}, {font_size:?}, {text:?}, {split_runs}, index={index}: \
-                                 expected {expected_x:?}, got {:?}",
+                                 expected {expected_caret_x:?}, got {:?}",
                                 shaped.x_for_index(index)
                             );
+                            // Hit test just inside the character, on the side opposite
+                            // to its caret, so that the position resolves to this
+                            // character. Right-to-left characters have their caret at
+                            // the right edge of the character.
+                            let probe_x = if (native_left + native_width - native_caret_x).abs()
+                                < 0.001
+                            {
+                                px(native_caret_x - 0.01)
+                            } else {
+                                px(native_caret_x + 0.01)
+                            };
                             assert_eq!(
-                                shaped.index_for_x(expected_x + px(0.01)),
+                                shaped.index_for_x(probe_x),
                                 Some(index),
                                 "{family}, {text:?}, index={index}"
                             );
                             let piece = cursor.take_until(end);
                             assert_eq!(piece.text.as_ref(), character.to_string());
-                            assert!(
-                                (piece.width - (expected_end - expected_x)).abs() < px(0.001),
-                                "{family}, {text:?}, index={index}"
-                            );
+                            if !is_bidirectional {
+                                assert!(
+                                    (piece.width - (expected_end - expected_x)).abs() < px(0.001),
+                                    "{family}, {text:?}, index={index}"
+                                );
+                            }
                             expected_x = expected_end;
                         }
                         assert!((shaped.width - expected_x).abs() < px(0.001));
@@ -1922,7 +2205,10 @@ mod tests {
                                 .abs()
                                 < px(0.001)
                         );
-                        assert_eq!(shaped.x_for_index(text.len()), shaped.width);
+                        assert_eq!(
+                            shaped.x_for_index(text.len()),
+                            px(native_caret_positions[text.encode_utf16().count()].0)
+                        );
                     }
                 }
             }
@@ -2040,37 +2326,111 @@ mod tests {
     #[test]
     fn test_cluster_map() {
         let cluster_map = [0];
-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 1);
-        let next = analyzer.next();
-        assert_eq!(next, Some((1, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, None);
+        assert_eq!(glyph_utf16_start_indices(&cluster_map, 1), [0]);
 
         let cluster_map = [0, 1, 2];
-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 3);
-        let next = analyzer.next();
-        assert_eq!(next, Some((1, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, Some((1, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, Some((1, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, None);
+        assert_eq!(glyph_utf16_start_indices(&cluster_map, 3), [0, 1, 2]);
+
         // 👨‍👩‍👧‍👦👩‍💻
         let cluster_map = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4];
-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 5);
-        let next = analyzer.next();
-        assert_eq!(next, Some((11, 4)));
-        let next = analyzer.next();
-        assert_eq!(next, Some((5, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, None);
+        assert_eq!(glyph_utf16_start_indices(&cluster_map, 5), [0, 0, 0, 0, 11]);
+
         // 👩‍💻
         let cluster_map = [0, 0, 0, 0, 0];
-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 1);
-        let next = analyzer.next();
-        assert_eq!(next, Some((5, 1)));
-        let next = analyzer.next();
-        assert_eq!(next, None);
+        assert_eq!(glyph_utf16_start_indices(&cluster_map, 1), [0]);
+    }
+
+    #[test]
+    fn test_cluster_map_handles_rtl_clusters() {
+        assert_eq!(
+            glyph_utf16_start_indices(&[4, 3, 2, 1, 0], 5),
+            [4, 3, 2, 1, 0]
+        );
+        assert_eq!(glyph_utf16_start_indices(&[2, 2, 0], 3), [2, 2, 0]);
+    }
+
+    #[test]
+    fn test_string_index_converter_handles_descending_utf16_indices() {
+        let text = "a\u{1f600}\u{628}";
+        let converter = StringIndexConverter::new(text);
+
+        assert_eq!(converter.utf8_ix_for_utf16_ix(4), text.len());
+        assert_eq!(converter.utf8_ix_for_utf16_ix(3), "a\u{1f600}".len());
+        assert_eq!(converter.utf8_ix_for_utf16_ix(2), "a\u{1f600}".len());
+        assert_eq!(converter.utf8_ix_for_utf16_ix(1), "a".len());
+        assert_eq!(converter.utf8_ix_for_utf16_ix(99), text.len());
+    }
+}
+
+#[cfg(test)]
+mod rtl_geometry_tests {
+    use super::{glyph_left, normalize_run_positions, run_bounds};
+    use gpui::{FontId, GlyphId, ShapedGlyph, ShapedRun, point, px};
+
+    #[test]
+    fn test_ltr_run_bounds_start_at_the_origin() {
+        assert_eq!(run_bounds(10.0, 25.0, false), (10.0, 35.0));
+    }
+
+    #[test]
+    fn test_rtl_run_bounds_end_at_the_origin() {
+        // DirectWrite reports the origin of a right-to-left run at its right
+        // edge, so the run extends to the left of the origin.
+        assert_eq!(run_bounds(35.0, 25.0, true), (10.0, 35.0));
+    }
+
+    #[test]
+    fn test_ltr_glyphs_advance_to_the_right() {
+        assert_eq!(glyph_left(10.0, 0.0, 8.0, 0.0, false), 10.0);
+        assert_eq!(glyph_left(10.0, 8.0, 6.0, 0.0, false), 18.0);
+    }
+
+    #[test]
+    fn test_rtl_glyphs_advance_to_the_left() {
+        // The first glyph of a right-to-left run is the rightmost one.
+        assert_eq!(glyph_left(35.0, 0.0, 8.0, 0.0, true), 27.0);
+        assert_eq!(glyph_left(35.0, 8.0, 6.0, 0.0, true), 21.0);
+    }
+
+    #[test]
+    fn test_normalize_run_positions_moves_rtl_paragraph_to_the_left_edge() {
+        let glyph = |x: f32, index: usize| ShapedGlyph {
+            id: GlyphId(index as u32),
+            position: point(px(x), px(0.0)),
+            index,
+            is_emoji: false,
+        };
+        let mut runs = vec![ShapedRun {
+            font_id: FontId(0),
+            glyphs: vec![glyph(27.0, 0), glyph(21.0, 1)],
+        }];
+
+        // A right-to-left paragraph is laid out against the right edge of the
+        // layout box, so its runs start at a non-zero offset.
+        let width = normalize_run_positions(&mut runs, 10.0, 35.0);
+
+        assert_eq!(width, px(25.0));
+        assert_eq!(runs[0].glyphs[0].position.x, px(17.0));
+        assert_eq!(runs[0].glyphs[1].position.x, px(11.0));
+    }
+
+    #[test]
+    fn test_normalize_run_positions_keeps_ltr_paragraph_untouched() {
+        let glyph = |x: f32, index: usize| ShapedGlyph {
+            id: GlyphId(index as u32),
+            position: point(px(x), px(0.0)),
+            index,
+            is_emoji: false,
+        };
+        let mut runs = vec![ShapedRun {
+            font_id: FontId(0),
+            glyphs: vec![glyph(0.0, 0), glyph(8.0, 1)],
+        }];
+
+        let width = normalize_run_positions(&mut runs, 0.0, 16.0);
+
+        assert_eq!(width, px(16.0));
+        assert_eq!(runs[0].glyphs[0].position.x, px(0.0));
+        assert_eq!(runs[0].glyphs[1].position.x, px(8.0));
     }
 }

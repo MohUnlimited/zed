@@ -386,6 +386,9 @@ mod tests {
             ascent: px(11.0),
             descent: px(3.0),
             len: index * 2,
+            index_positions: Vec::new(),
+            visual_index_positions: Vec::new(),
+            direction: gpui::TextDirection::LeftToRight,
         }
     }
 
